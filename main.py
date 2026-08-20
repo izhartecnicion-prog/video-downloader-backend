@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import yt_dlp
 import requests
 
-# 1. FastAPI App Initialization (Yeh lazmi sabse upar hona chahiye)
 app = FastAPI(title="Universal Social Video Downloader API")
 
 app.add_middleware(
@@ -19,13 +18,21 @@ app.add_middleware(
 class VideoRequest(BaseModel):
     url: str
 
+def clean_url(raw_url: str) -> str:
+    url = raw_url.strip().strip("'").strip('"')
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    return url
+
 @app.get("/")
 def home():
     return {"status": "online", "message": "Downloader API is active"}
 
-# 2. Metadata & Formats Extractor Endpoint
 @app.post("/api/v1/extract")
 def extract_video_info(data: VideoRequest):
+    target_url = clean_url(data.url)
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -35,7 +42,7 @@ def extract_video_info(data: VideoRequest):
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(data.url.strip(), download=False)
+            info = ydl.extract_info(target_url, download=False)
             
             formats_list = []
             if 'formats' in info:
@@ -73,9 +80,9 @@ def extract_video_info(data: VideoRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# 3. Direct Streaming Proxy Endpoint
 @app.get("/api/v1/stream")
 def stream_media(url: str = Query(...), format_id: str = Query("best")):
+    target_url = clean_url(url)
     ydl_opts = {
         'format': format_id if format_id != 'best' else 'best[ext=mp4]/best',
         'quiet': True,
@@ -83,23 +90,23 @@ def stream_media(url: str = Query(...), format_id: str = Query("best")):
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url.strip(), download=False)
-            target_url = info.get('url')
+            info = ydl.extract_info(target_url, download=False)
+            stream_link = info.get('url')
             
-            if not target_url and 'formats' in info:
+            if not stream_link and 'formats' in info:
                 for f in reversed(info['formats']):
                     if f.get('url'):
-                        target_url = f.get('url')
+                        stream_link = f.get('url')
                         break
 
-            if not target_url:
+            if not stream_link:
                 raise HTTPException(status_code=404, detail="Direct media URL not found")
 
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': url.strip()
+                'Referer': target_url
             }
-            req = requests.get(target_url, headers=headers, stream=True, timeout=60)
+            req = requests.get(stream_link, headers=headers, stream=True, timeout=60)
 
             def iter_chunks():
                 for chunk in req.iter_content(chunk_size=1024 * 64):
