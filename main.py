@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -6,7 +6,6 @@ import yt_dlp
 import requests
 import logging
 from typing import Optional, List, Dict, Any
-import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -38,8 +37,16 @@ class ExtractResponse(BaseModel):
     formats: List[Dict[str, Any]]
 
 # Helper Functions
+def clean_url(raw_url: str) -> str:
+    """Sanitize incoming URL strings from mobile app"""
+    url = raw_url.strip().strip("'").strip('"')
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    return url
+
 def safe_int(value: Any, default: int = 0) -> int:
-    """Safely convert any value to integer"""
     try:
         if isinstance(value, int):
             return value
@@ -51,43 +58,25 @@ def safe_int(value: Any, default: int = 0) -> int:
     except (ValueError, TypeError):
         return default
 
-def safe_float(value: Any, default: float = 0.0) -> float:
-    """Safely convert any value to float"""
-    try:
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            return float(value) if value else default
-        return default
-    except (ValueError, TypeError):
-        return default
-
 def safe_str(value: Any, default: str = "Unknown") -> str:
-    """Safely convert any value to string"""
     try:
         if isinstance(value, str):
             return value.strip()
         if value is None:
             return default
         return str(value).strip()
-    except:
+    except Exception:
         return default
 
 def get_best_format(formats: List[Dict]) -> Optional[Dict]:
-    """Get best video format from list"""
     if not formats:
         return None
-    
-    # Prefer video with audio
     for f in sorted(formats, key=lambda x: safe_int(x.get('height'), 0), reverse=True):
         if f.get('url') and f.get('vcodec') != 'none':
             return f
-    
-    # If no video, try best video only
     for f in sorted(formats, key=lambda x: safe_int(x.get('height'), 0), reverse=True):
         if f.get('url'):
             return f
-    
     return formats[0] if formats else None
 
 # ============================================================================
@@ -95,7 +84,6 @@ def get_best_format(formats: List[Dict]) -> Optional[Dict]:
 # ============================================================================
 @app.get("/")
 def health_check():
-    """Health check endpoint"""
     return {
         "status": "online",
         "message": "Universal Social Video Downloader API is active",
@@ -108,15 +96,8 @@ def health_check():
 @app.post("/api/extract", response_model=ExtractResponse)
 @app.post("/api/v1/extract", response_model=ExtractResponse)
 def extract_video_info(data: VideoRequest):
-    """
-    Extract video information and available formats from URL
-    Supports: YouTube, TikTok, Instagram, Facebook, Twitter, etc.
-    """
     try:
-        url = data.url.strip()
-        if not url:
-            raise HTTPException(status_code=400, detail="URL cannot be empty")
-        
+        url = clean_url(data.url)
         logger.info(f"🔍 Extracting: {url}")
         
         ydl_opts = {
@@ -130,32 +111,18 @@ def extract_video_info(data: VideoRequest):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # Extract title safely
             title = safe_str(info.get('title'), 'Social Media Content')
-            
-            # Extract duration safely
             duration = safe_int(info.get('duration'), 0)
-            
-            # Extract thumbnail
             thumbnail = safe_str(info.get('thumbnail'), '')
+            platform = safe_str(info.get('extractor_key') or info.get('extractor'), 'Unknown')
             
-            # Extract platform
-            platform = safe_str(
-                info.get('extractor_key') or info.get('extractor'),
-                'Unknown'
-            )
-            
-            # Process formats
             formats_list = []
-            
             if 'formats' in info and info['formats']:
                 for f in info['formats']:
                     try:
-                        # Skip formats without URL
                         if not f.get('url'):
                             continue
                         
-                        # Safe type conversions
                         format_id = safe_str(f.get('format_id'), 'default')
                         ext = safe_str(f.get('ext'), 'mp4').lower()
                         height = safe_int(f.get('height'), 0)
@@ -164,14 +131,12 @@ def extract_video_info(data: VideoRequest):
                         bitrate = safe_int(f.get('abr') or f.get('vbr'), 0)
                         fps = safe_int(f.get('fps'), 0)
                         
-                        # Determine if audio
                         vcodec = safe_str(f.get('vcodec'), 'unknown')
                         acodec = safe_str(f.get('acodec'), 'unknown')
                         is_audio = vcodec == 'none' or ext in ['mp3', 'm4a', 'aac', 'opus', 'wav']
                         
-                        # Format resolution label
                         if is_audio:
-                            resolution_label = f"{bitrate}kbps MP3" if bitrate else "Audio"
+                            resolution_label = f"{bitrate}kbps MP3" if bitrate else "Audio MP3"
                         elif height > 0:
                             resolution_label = f"{height}p"
                         elif width > 0:
@@ -179,10 +144,9 @@ def extract_video_info(data: VideoRequest):
                         else:
                             resolution_label = "HD"
                         
-                        # Calculate filesize in MB
                         filesize_mb = round(filesize / (1024 * 1024), 2) if filesize > 0 else None
                         
-                        format_dict = {
+                        formats_list.append({
                             "id": format_id,
                             "format_id": format_id,
                             "resolution": resolution_label,
@@ -197,14 +161,10 @@ def extract_video_info(data: VideoRequest):
                             "acodec": acodec,
                             "bitrate": bitrate,
                             "fps": fps
-                        }
-                        
-                        formats_list.append(format_dict)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Error processing format: {e}")
+                        })
+                    except Exception:
                         continue
             
-            # Fallback: if no formats found, use best option
             if not formats_list and info.get('url'):
                 formats_list.append({
                     "id": "best",
@@ -224,9 +184,7 @@ def extract_video_info(data: VideoRequest):
                 })
             
             if not formats_list:
-                raise HTTPException(status_code=400, detail="No formats available")
-            
-            logger.info(f"✅ Found {len(formats_list)} formats for: {title}")
+                raise HTTPException(status_code=400, detail="No downloadable formats available")
             
             return {
                 "title": title,
@@ -237,122 +195,77 @@ def extract_video_info(data: VideoRequest):
             }
     
     except HTTPException as e:
-        logger.error(f"❌ HTTP Error: {e.detail}")
         raise e
     except Exception as e:
         logger.error(f"❌ Extraction Error: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Extraction failed: {str(e)}")
 
 # ============================================================================
-# ENDPOINT 3: Direct Download/Stream
+# ENDPOINT 3: Direct Streaming Proxy
 # ============================================================================
 @app.get("/api/download")
 @app.get("/api/v1/download")
-def download_media(url: str = Query(...), format_id: str = Query("best")):
-    """
-    Download or stream media directly
-    Returns file as streaming response
-    """
+@app.get("/api/stream")
+@app.get("/api/v1/stream")
+def stream_media(url: str = Query(...), format_id: str = Query("best")):
     try:
-        url = url.strip()
-        if not url:
-            raise HTTPException(status_code=400, detail="URL required")
+        clean_target_url = clean_url(url)
+        logger.info(f"📥 Streaming request for: {clean_target_url} | Format: {format_id}")
         
-        logger.info(f"📥 Downloading: {url} | Format: {format_id}")
-        
+        target_format = format_id if format_id != 'best' else 'best[ext=mp4]/best'
         ydl_opts = {
-            'format': format_id if format_id != 'best' else 'best[ext=mp4]/best',
+            'format': target_format,
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'socket_timeout': 30,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(clean_target_url, download=False)
+            stream_link = info.get('url')
             
-            # Get download URL
-            download_url = info.get('url')
-            
-            if not download_url and 'formats' in info:
+            if not stream_link and 'formats' in info:
                 best = get_best_format(info['formats'])
                 if best:
-                    download_url = best.get('url')
+                    stream_link = best.get('url')
             
-            if not download_url:
-                raise HTTPException(status_code=404, detail="No downloadable URL found")
+            if not stream_link:
+                raise HTTPException(status_code=404, detail="Direct media stream URL not found")
             
-            # Get title for filename
-            title = safe_str(info.get('title'), 'media')
-            ext = safe_str(info.get('ext'), 'mp4')
-            filename = f"{title[:50]}.{ext}".replace('/', '_')
-            
-            # Make request with headers
-            headers = {
+            # Extract request headers required by TikTok/IG CDN
+            req_headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': url,
-                'Range': 'bytes=0-'
+                'Referer': clean_target_url
             }
+            if info.get('http_headers'):
+                req_headers.update(info.get('http_headers'))
             
-            req = requests.get(
-                download_url,
-                headers=headers,
-                stream=True,
-                timeout=60,
-                allow_redirects=True
-            )
+            req = requests.get(stream_link, headers=req_headers, stream=True, timeout=90)
             
             if req.status_code >= 400:
-                logger.error(f"❌ Download failed: {req.status_code}")
-                raise HTTPException(
-                    status_code=req.status_code,
-                    detail=f"Server error: {req.status_code}"
-                )
+                raise HTTPException(status_code=req.status_code, detail=f"Source server error: {req.status_code}")
             
             def iter_chunks():
-                try:
-                    for chunk in req.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            yield chunk
-                except Exception as e:
-                    logger.error(f"❌ Stream error: {e}")
-                    raise
+                for chunk in req.iter_content(chunk_size=1024 * 64):
+                    if chunk:
+                        yield chunk
             
-            content_type = req.headers.get('Content-Type', 'application/octet-stream')
-            content_length = req.headers.get('Content-Length')
-            
-            response_headers = {
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Content-Type': content_type,
-                'Accept-Ranges': 'bytes',
+            resp_headers = {
+                "Content-Disposition": 'attachment; filename="media.mp4"',
+                "Content-Type": req.headers.get('Content-Type', 'video/mp4')
             }
+            if 'Content-Length' in req.headers:
+                resp_headers['Content-Length'] = req.headers['Content-Length']
             
-            if content_length:
-                response_headers['Content-Length'] = content_length
+            return StreamingResponse(iter_chunks(), headers=resp_headers, media_type="video/mp4")
             
-            logger.info(f"✅ Streaming: {filename}")
-            
-            return StreamingResponse(
-                iter_chunks(),
-                headers=response_headers,
-                media_type=content_type
-            )
-    
     except HTTPException as e:
-        logger.error(f"❌ HTTP Error: {e.detail}")
         raise e
     except Exception as e:
-        logger.error(f"❌ Download Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
-
-# ============================================================================
-# ENDPOINT 4: Stream with Format Selection
-# ============================================================================
-@app.get("/api/stream")
-@app.get("/api/v1/stream")
-def stream_media(url: str = Query(...), format_id: str = Query("best")):
-    """Stream media with format selection"""
-    return download_media(url=url, format_id=format_id)
+        logger.error(f"❌ Stream Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Streaming failed: {str(e)}")
 
 # ============================================================================
 # Error Handlers
@@ -382,9 +295,4 @@ async def general_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
