@@ -116,3 +116,4 @@ def stream_media(url: str = Query(...), format_id: str = Query("best")):
             return StreamingResponse(iter_chunks(), headers=resp_headers, media_type="video/mp4")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
