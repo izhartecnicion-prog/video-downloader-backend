@@ -7,7 +7,9 @@ import logging
 import tempfile
 import os
 import uuid
-import re 
+import re
+import shutil
+import threading
 from typing import Optional, List, Dict, Any
 
 # ============================================================
@@ -27,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Universal Social Video Downloader API",
-    version="2.0.0",
-    description="Universal social media video downloader"
+    version="3.0.0",
+    description="Universal social media video/audio downloader with TikTok support"
 )
 
 app.add_middleware(
@@ -60,7 +62,8 @@ class ExtractResponse(BaseModel):
 # ============================================================
 
 def clean_url(raw_url: str) -> str:
-
+    """Clean and normalize URL"""
+    
     if not raw_url:
         raise ValueError("URL is empty")
 
@@ -77,7 +80,8 @@ def clean_url(raw_url: str) -> str:
 
 
 def safe_int(value: Any, default: int = 0) -> int:
-
+    """Safely convert value to integer"""
+    
     try:
 
         if isinstance(value, int):
@@ -95,8 +99,9 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def safe_str(value: Any, default: str = ""):
-
+def safe_str(value: Any, default: str = "") -> str:
+    """Safely convert value to string"""
+    
     try:
 
         if value is None:
@@ -108,8 +113,9 @@ def safe_str(value: Any, default: str = ""):
         return default
 
 
-def safe_filename(name: str):
-
+def safe_filename(name: str) -> str:
+    """Sanitize filename for OS compatibility"""
+    
     name = safe_str(name, "video")
 
     name = re.sub(
@@ -126,12 +132,30 @@ def safe_filename(name: str):
     return name[:150]
 
 
+def cleanup_temp_dir(temp_dir: str, delay: float = 30):
+    """Cleanup temp directory after delay"""
+    
+    def delayed_cleanup():
+        import time
+        time.sleep(delay)
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                logger.info(f"CLEANUP: Removed temp dir {temp_dir}")
+        except Exception as e:
+            logger.error(f"CLEANUP ERROR: {e}")
+    
+    thread = threading.Thread(target=delayed_cleanup, daemon=True)
+    thread.start()
+
+
 # ============================================================
 # YT-DLP OPTIONS
 # ============================================================
 
 def get_extract_options():
-
+    """Get yt-dlp options for extraction"""
+    
     return {
 
         "quiet": True,
@@ -179,13 +203,73 @@ def get_extract_options():
     }
 
 
+def get_download_options(temp_dir: str, job_id: str):
+    """Get yt-dlp options for downloading"""
+    
+    return {
+
+        "quiet": False,
+
+        "no_warnings": True,
+
+        "noplaylist": True,
+
+        "socket_timeout": 60,
+
+        "retries": 5,
+
+        "fragment_retries": 5,
+
+        "concurrent_fragment_downloads": 4,
+
+        "http_chunk_size": 10485760,
+
+        "outtmpl": os.path.join(
+            temp_dir,
+            f"{job_id}.%(ext)s"
+        ),
+
+        "merge_output_format": "mp4",
+
+        "overwrites": True,
+
+        "continuedl": False,
+
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "prefixes": ["best"],
+                "format": "mp4",
+            }
+        ],
+
+        "user_agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36",
+
+        "http_headers": {
+
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/139.0.0.0 Safari/537.36",
+
+        },
+
+    }
+
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
 
 @app.get("/")
 def health_check():
-
+    """Root health check"""
+    
     return {
 
         "status": "online",
@@ -193,7 +277,7 @@ def health_check():
         "message":
             "Universal Social Video Downloader API is active",
 
-        "version": "2.0.0"
+        "version": "3.0.0"
 
     }
 
@@ -204,12 +288,15 @@ def health_check():
 
 @app.get("/api/health")
 def health():
-
+    """Health status with version info"""
+    
     return {
 
         "status": "ok",
 
         "service": "video-downloader-backend",
+
+        "version": "3.0.0",
 
         "yt_dlp": yt_dlp.version.__version__
 
@@ -217,24 +304,36 @@ def health():
 
 
 # ============================================================
-# EXTRACT
+# EXTRACT - V3.0 WITH TIKTOK SUPPORT
 # ============================================================
 
 @app.post("/api/extract")
 @app.post("/api/v1/extract")
 def extract_video_info(data: VideoRequest):
-
+    """Extract video information and available formats"""
+    
     try:
 
         original_url = clean_url(data.url)
 
         logger.info(
-            f"EXTRACT REQUEST: {original_url}"
+            f"🔍 EXTRACT REQUEST: {original_url}"
+        )
+
+        # Detect platform
+        is_tiktok = (
+            "tiktok.com" in original_url or
+            "vm.tiktok" in original_url or
+            "vt.tiktok" in original_url
         )
 
         opts = get_extract_options()
-
         opts["skip_download"] = True
+
+        # TikTok specific options
+        if is_tiktok:
+            opts["socket_timeout"] = 90
+            opts["retries"] = 10
 
         with yt_dlp.YoutubeDL(opts) as ydl:
 
@@ -389,8 +488,8 @@ def extract_video_info(data: VideoRequest):
                         if filesize
                         else None,
 
-                    # IMPORTANT:
-                    # DO NOT SEND TIKTOK CDN URL
+                    # V3.0: NO CDN URL
+                    # Backend generates fresh one each download
                     "url": None,
 
                     "is_audio": is_audio,
@@ -410,7 +509,7 @@ def extract_video_info(data: VideoRequest):
                 continue
 
         # ====================================================
-        # FALLBACK
+        # FALLBACK IF NO FORMATS
         # ====================================================
 
         if not formats_list:
@@ -455,6 +554,12 @@ def extract_video_info(data: VideoRequest):
 
             })
 
+        logger.info(
+            f"✅ EXTRACTION SUCCESS: {title} "
+            f"({len(formats_list)} formats) | "
+            f"Platform: {platform}"
+        )
+
         return {
 
             "title": title,
@@ -489,7 +594,7 @@ def extract_video_info(data: VideoRequest):
 
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD - V3.0 WITH AUTO MP4 MERGING
 # ============================================================
 
 @app.get("/api/download")
@@ -503,6 +608,7 @@ def download_video(
     format_id: str = Query("best")
 
 ):
+    """Download video/audio with automatic MP4 merging"""
 
     temp_dir = tempfile.mkdtemp(
         prefix="video_dl_"
@@ -515,15 +621,15 @@ def download_video(
         original_url = clean_url(url)
 
         logger.info(
-            f"DOWNLOAD REQUEST | JOB={job_id}"
+            f"📥 DOWNLOAD REQUEST | JOB={job_id}"
         )
 
         logger.info(
-            f"URL={original_url}"
+            f"URL: {original_url}"
         )
 
         logger.info(
-            f"FORMAT={format_id}"
+            f"FORMAT: {format_id}"
         )
 
         # ====================================================
@@ -535,64 +641,40 @@ def download_video(
             or format_id.lower() == "best"
         ):
 
-            # Best video + audio.
-            # If source provides combined stream,
-            # yt-dlp will use it.
+            # Best video + audio combination
+            # yt-dlp automatically merges if needed
             format_selector = (
                 "bv*+ba/b"
             )
 
         else:
 
-            # User selected a format.
-            # Add audio fallback.
+            # User selected format
+            # Add fallbacks for reliability
             format_selector = (
                 f"{format_id}+ba/"
                 f"{format_id}/"
                 "bv*+ba/b"
             )
 
-        output_template = os.path.join(
-
-            temp_dir,
-
-            f"{job_id}.%(ext)s"
-
+        logger.info(
+            f"FORMAT SELECTOR: {format_selector}"
         )
 
-        opts = get_extract_options()
-
-        opts.update({
-
-            "format":
-                format_selector,
-
-            "outtmpl":
-                output_template,
-
-            "merge_output_format":
-                "mp4",
-
-            "noplaylist":
-                True,
-
-            "overwrites":
-                True,
-
-            "continuedl":
-                False,
-
-            "retries":
-                5,
-
-            "fragment_retries":
-                5,
-
-        })
-
         # ====================================================
-        # DOWNLOAD WITH YT-DLP
+        # YT-DLP DOWNLOAD + MERGE
         # ====================================================
+
+        opts = get_download_options(
+            temp_dir,
+            job_id
+        )
+
+        opts["format"] = format_selector
+
+        logger.info(
+            f"🚀 Starting download | JOB={job_id}"
+        )
 
         with yt_dlp.YoutubeDL(opts) as ydl:
 
@@ -669,10 +751,15 @@ def download_video(
             final_file
         )
 
+        file_size_mb = round(
+            file_size / (1024 * 1024),
+            2
+        )
+
         logger.info(
-            f"DOWNLOAD COMPLETE | "
+            f"✅ DOWNLOAD COMPLETE | "
             f"JOB={job_id} | "
-            f"SIZE={file_size}"
+            f"SIZE: {file_size_mb}MB"
         )
 
         title = safe_filename(
@@ -685,6 +772,9 @@ def download_video(
         download_name = (
             f"{title}.mp4"
         )
+
+        # Schedule cleanup after 60 seconds
+        cleanup_temp_dir(temp_dir, delay=60)
 
         return FileResponse(
 
@@ -708,6 +798,13 @@ def download_video(
             f"DOWNLOAD ERROR | JOB={job_id}"
         )
 
+        # Cleanup on error immediately
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+        except:
+            pass
+
         raise HTTPException(
 
             status_code=500,
@@ -727,6 +824,7 @@ async def http_exception_handler(
     request,
     exc
 ):
+    """Handle HTTP exceptions"""
 
     return JSONResponse(
 
@@ -751,6 +849,7 @@ async def general_exception_handler(
     request,
     exc
 ):
+    """Handle unhandled exceptions"""
 
     logger.exception(
         "UNHANDLED SERVER ERROR"
