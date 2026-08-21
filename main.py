@@ -2,13 +2,18 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+
 import yt_dlp
 import logging
 import tempfile
 import os
 import uuid
 import re
+import shutil
+import glob
+
 from typing import Optional, List, Dict, Any
+
 
 # ============================================================
 # LOGGING
@@ -19,7 +24,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("video-downloader")
+
 
 # ============================================================
 # FASTAPI
@@ -27,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Universal Social Video Downloader API",
-    version="2.0.0",
+    version="3.0.0",
     description="Universal social media video downloader"
 )
 
@@ -38,6 +44,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ============================================================
 # MODELS
@@ -56,6 +63,32 @@ class ExtractResponse(BaseModel):
 
 
 # ============================================================
+# CONSTANTS
+# ============================================================
+
+VIDEO_EXTENSIONS = {
+    "mp4",
+    "webm",
+    "mkv",
+    "mov",
+    "avi",
+    "flv",
+    "ts",
+    "m4v"
+}
+
+AUDIO_EXTENSIONS = {
+    "mp3",
+    "m4a",
+    "aac",
+    "opus",
+    "wav",
+    "flac",
+    "ogg"
+}
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -64,14 +97,22 @@ def clean_url(raw_url: str) -> str:
     if not raw_url:
         raise ValueError("URL is empty")
 
-    url = raw_url.strip()
-    url = url.strip("'").strip('"')
+    url = str(raw_url).strip()
 
+    # Remove surrounding quotes
+    url = url.strip("'").strip('"').strip()
+
+    # Protocol-relative URL
     if url.startswith("//"):
         url = "https:" + url
 
-    elif not url.startswith("http://") and not url.startswith("https://"):
+    # Missing protocol
+    elif not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # Remove accidental trailing punctuation
+    while url.endswith(("'", '"', ">", ".", ",")):
+        url = url[:-1].strip()
 
     return url
 
@@ -80,6 +121,12 @@ def safe_int(value: Any, default: int = 0) -> int:
 
     try:
 
+        if value is None:
+            return default
+
+        if isinstance(value, bool):
+            return int(value)
+
         if isinstance(value, int):
             return value
 
@@ -87,28 +134,52 @@ def safe_int(value: Any, default: int = 0) -> int:
             return int(value)
 
         if isinstance(value, str):
-            return int(float(value)) if value else default
+
+            value = value.strip()
+
+            if not value:
+                return default
+
+            return int(float(value))
 
         return default
 
     except Exception:
+
         return default
 
 
-def safe_str(value: Any, default: str = ""):
+def safe_float(value: Any, default: float = 0.0) -> float:
 
     try:
 
         if value is None:
             return default
 
-        return str(value).strip()
+        return float(value)
 
     except Exception:
+
         return default
 
 
-def safe_filename(name: str):
+def safe_str(value: Any, default: str = "") -> str:
+
+    try:
+
+        if value is None:
+            return default
+
+        text = str(value).strip()
+
+        return text if text else default
+
+    except Exception:
+
+        return default
+
+
+def safe_filename(name: str) -> str:
 
     name = safe_str(name, "video")
 
@@ -118,7 +189,13 @@ def safe_filename(name: str):
         name
     )
 
-    name = name.strip()
+    name = re.sub(
+        r"\s+",
+        " ",
+        name
+    )
+
+    name = name.strip(" .")
 
     if not name:
         name = "video"
@@ -126,11 +203,83 @@ def safe_filename(name: str):
     return name[:150]
 
 
+def format_size(size: int) -> Optional[float]:
+
+    if size <= 0:
+        return None
+
+    return round(
+        size / 1048576,
+        2
+    )
+
+
+def is_audio_format(f: Dict[str, Any]) -> bool:
+
+    ext = safe_str(
+        f.get("ext"),
+        ""
+    ).lower()
+
+    vcodec = safe_str(
+        f.get("vcodec"),
+        "none"
+    ).lower()
+
+    return (
+        vcodec == "none"
+        or ext in AUDIO_EXTENSIONS
+    )
+
+
+def is_video_format(f: Dict[str, Any]) -> bool:
+
+    ext = safe_str(
+        f.get("ext"),
+        ""
+    ).lower()
+
+    vcodec = safe_str(
+        f.get("vcodec"),
+        "none"
+    ).lower()
+
+    return (
+        vcodec != "none"
+        and ext not in AUDIO_EXTENSIONS
+    )
+
+
+def get_ffmpeg_path() -> Optional[str]:
+
+    # First check PATH
+    path = shutil.which("ffmpeg")
+
+    if path:
+        return path
+
+    # Common locations
+    possible = [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+    ]
+
+    for p in possible:
+
+        if os.path.isfile(p):
+            return p
+
+    return None
+
+
 # ============================================================
 # YT-DLP OPTIONS
 # ============================================================
 
-def get_extract_options():
+def get_base_options() -> Dict[str, Any]:
 
     return {
 
@@ -142,15 +291,25 @@ def get_extract_options():
 
         "socket_timeout": 60,
 
-        "retries": 5,
+        "retries": 10,
 
-        "fragment_retries": 5,
+        "fragment_retries": 10,
 
-        "file_access_retries": 5,
+        "file_access_retries": 10,
+
+        "extractor_retries": 5,
 
         "concurrent_fragment_downloads": 4,
 
         "http_chunk_size": 10485760,
+
+        "continuedl": False,
+
+        "overwrites": True,
+
+        "geo_bypass": True,
+
+        "nocheckcertificate": True,
 
         "user_agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -179,39 +338,149 @@ def get_extract_options():
     }
 
 
+def get_extract_options() -> Dict[str, Any]:
+
+    opts = get_base_options()
+
+    opts.update({
+
+        "skip_download": True,
+
+    })
+
+    return opts
+
+
 # ============================================================
-# HEALTH CHECK
+# SMART FORMAT SELECTION
+# ============================================================
+
+def get_format_selector(
+    format_id: str
+) -> str:
+
+    requested = safe_str(
+        format_id,
+        "best"
+    )
+
+    # BEST
+    if requested.lower() in {
+        "",
+        "best",
+        "auto",
+        "default"
+    }:
+
+        # Prefer MP4 video + M4A audio.
+        #
+        # bv* = best video
+        # ba  = best audio
+        #
+        # /b = fallback to combined stream
+        #
+        return (
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "bv*+ba/"
+            "b[ext=mp4]/"
+            "b"
+        )
+
+    # Audio requested
+    if requested.lower() in {
+        "audio",
+        "bestaudio"
+    }:
+
+        return (
+            "ba[ext=m4a]/"
+            "ba/"
+            "bestaudio"
+        )
+
+    # Specific video format.
+    #
+    # Important:
+    # Try exact video + audio first.
+    # Then exact format alone.
+    # Then generic best fallback.
+    return (
+        f"{requested}+ba[ext=m4a]/"
+        f"{requested}+ba/"
+        f"{requested}/"
+        "bv*[ext=mp4]+ba[ext=m4a]/"
+        "bv*+ba/"
+        "b[ext=mp4]/"
+        "b"
+    )
+
+
+# ============================================================
+# HEALTH
 # ============================================================
 
 @app.get("/")
-def health_check():
+def root():
+
+    ffmpeg = get_ffmpeg_path()
 
     return {
 
         "status": "online",
 
-        "message":
-            "Universal Social Video Downloader API is active",
+        "service":
+            "Universal Social Video Downloader API",
 
-        "version": "2.0.0"
+        "version":
+            "3.0.0",
+
+        "yt_dlp":
+            yt_dlp.version.__version__,
+
+        "ffmpeg":
+            bool(ffmpeg),
+
+        "ffmpeg_path":
+            ffmpeg,
+
+        "endpoints": [
+
+            "POST /api/extract",
+            "POST /api/v1/extract",
+
+            "GET /api/download",
+            "GET /api/v1/download",
+
+            "GET /api/stream",
+            "GET /api/v1/stream",
+
+            "GET /api/health"
+
+        ]
 
     }
 
 
-# ============================================================
-# HEALTH / PING
-# ============================================================
-
 @app.get("/api/health")
 def health():
+
+    ffmpeg = get_ffmpeg_path()
 
     return {
 
         "status": "ok",
 
-        "service": "video-downloader-backend",
+        "service":
+            "video-downloader-backend",
 
-        "yt_dlp": yt_dlp.version.__version__
+        "version":
+            "3.0.0",
+
+        "yt_dlp":
+            yt_dlp.version.__version__,
+
+        "ffmpeg":
+            bool(ffmpeg)
 
     }
 
@@ -222,19 +491,21 @@ def health():
 
 @app.post("/api/extract")
 @app.post("/api/v1/extract")
-def extract_video_info(data: VideoRequest):
+def extract_video_info(
+    data: VideoRequest
+):
 
     try:
 
-        original_url = clean_url(data.url)
+        original_url = clean_url(
+            data.url
+        )
 
         logger.info(
             f"EXTRACT REQUEST: {original_url}"
         )
 
         opts = get_extract_options()
-
-        opts["skip_download"] = True
 
         with yt_dlp.YoutubeDL(opts) as ydl:
 
@@ -247,7 +518,8 @@ def extract_video_info(data: VideoRequest):
 
             raise HTTPException(
                 status_code=400,
-                detail="Unable to extract video information"
+                detail=
+                "Unable to extract video information."
             )
 
         title = safe_str(
@@ -271,13 +543,32 @@ def extract_video_info(data: VideoRequest):
             "Unknown"
         )
 
+        uploader = safe_str(
+            info.get("uploader")
+            or info.get("creator")
+            or info.get("channel"),
+            ""
+        )
+
         formats_list = []
 
-        formats = info.get("formats") or []
+        formats = info.get(
+            "formats"
+        ) or []
+
+        # ====================================================
+        # FORMATS
+        # ====================================================
 
         for f in formats:
 
             try:
+
+                direct_url = f.get("url")
+
+                # We deliberately do not expose CDN URLs
+                # to Flutter.
+                _ = direct_url
 
                 format_id = safe_str(
                     f.get("format_id"),
@@ -297,7 +588,7 @@ def extract_video_info(data: VideoRequest):
                 ext = safe_str(
                     f.get("ext"),
                     "mp4"
-                )
+                ).lower()
 
                 vcodec = safe_str(
                     f.get("vcodec"),
@@ -310,7 +601,8 @@ def extract_video_info(data: VideoRequest):
                 )
 
                 filesize = safe_int(
-                    f.get("filesize"),
+                    f.get("filesize")
+                    or f.get("filesize_approx"),
                     0
                 )
 
@@ -319,43 +611,69 @@ def extract_video_info(data: VideoRequest):
                     0
                 )
 
-                abr = safe_int(
+                abr = safe_float(
                     f.get("abr"),
                     0
                 )
 
-                vbr = safe_int(
+                vbr = safe_float(
                     f.get("vbr"),
                     0
                 )
 
                 bitrate = abr or vbr
 
-                is_audio = (
-                    vcodec == "none"
-                    or ext.lower()
-                    in [
-                        "mp3",
-                        "m4a",
-                        "aac",
-                        "opus",
-                        "wav"
-                    ]
-                )
+                audio = is_audio_format(f)
 
-                if is_audio:
+                video = is_video_format(f)
 
-                    resolution = (
-                        f"{bitrate}kbps"
-                        if bitrate
-                        else "Audio"
-                    )
+                # Skip completely unusable formats
+                if not audio and not video:
+                    continue
 
-                elif height:
+                # =================================================
+                # LABEL
+                # =================================================
 
-                    resolution = f"{height}p"
+                if audio:
 
-                elif width:
+                    if bitrate > 0:
+
+                        resolution = (
+                            f"{int(bitrate)} kbps"
+                        )
+
+                    else:
+
+                        resolution = "Audio"
+
+                elif height > 0:
+
+                    if height >= 2160:
+
+                        resolution = "2160p 4K"
+
+                    elif height >= 1440:
+
+                        resolution = "1440p 2K"
+
+                    elif height >= 1080:
+
+                        resolution = "1080p Full HD"
+
+                    elif height >= 720:
+
+                        resolution = "720p HD"
+
+                    elif height >= 480:
+
+                        resolution = "480p"
+
+                    else:
+
+                        resolution = f"{height}p"
+
+                elif width > 0 and height > 0:
 
                     resolution = (
                         f"{width}x{height}"
@@ -367,45 +685,71 @@ def extract_video_info(data: VideoRequest):
 
                 formats_list.append({
 
-                    "id": format_id,
+                    "id":
+                        format_id,
 
-                    "format_id": format_id,
+                    "format_id":
+                        format_id,
 
-                    "resolution": resolution,
+                    "resolution":
+                        resolution,
 
-                    "height": height,
+                    "quality_label":
+                        resolution,
 
-                    "width": width,
+                    "height":
+                        height,
 
-                    "ext": ext,
+                    "width":
+                        width,
 
-                    "filesize": filesize,
+                    "ext":
+                        ext,
+
+                    "extension":
+                        ext,
+
+                    "filesize":
+                        filesize,
+
+                    "filesize_bytes":
+                        filesize,
 
                     "filesize_mb":
-                        round(
-                            filesize / 1048576,
-                            2
-                        )
-                        if filesize
-                        else None,
+                        format_size(filesize),
 
-                    # IMPORTANT:
-                    # DO NOT SEND TIKTOK CDN URL
-                    "url": None,
+                    # NEVER expose CDN URL
+                    "url":
+                        None,
 
-                    "is_audio": is_audio,
+                    "direct_url":
+                        None,
 
-                    "vcodec": vcodec,
+                    "is_audio":
+                        audio,
 
-                    "acodec": acodec,
+                    "is_video":
+                        video,
 
-                    "bitrate": bitrate,
+                    "vcodec":
+                        vcodec,
 
-                    "fps": fps
+                    "acodec":
+                        acodec,
+
+                    "bitrate":
+                        int(bitrate),
+
+                    "fps":
+                        fps
 
                 })
 
-            except Exception:
+            except Exception as format_error:
+
+                logger.warning(
+                    f"FORMAT SKIPPED: {format_error}"
+                )
 
                 continue
 
@@ -417,11 +761,17 @@ def extract_video_info(data: VideoRequest):
 
             formats_list.append({
 
-                "id": "best",
+                "id":
+                    "best",
 
-                "format_id": "best",
+                "format_id":
+                    "best",
 
-                "resolution": "Best Quality",
+                "resolution":
+                    "Best Quality",
+
+                "quality_label":
+                    "Best Quality",
 
                 "height":
                     safe_int(
@@ -435,37 +785,144 @@ def extract_video_info(data: VideoRequest):
                         0
                     ),
 
-                "ext": "mp4",
+                "ext":
+                    "mp4",
 
-                "filesize": 0,
+                "extension":
+                    "mp4",
 
-                "filesize_mb": None,
+                "filesize":
+                    0,
 
-                "url": None,
+                "filesize_bytes":
+                    0,
 
-                "is_audio": False,
+                "filesize_mb":
+                    None,
 
-                "vcodec": "unknown",
+                "url":
+                    None,
 
-                "acodec": "unknown",
+                "direct_url":
+                    None,
 
-                "bitrate": 0,
+                "is_audio":
+                    False,
 
-                "fps": 0
+                "is_video":
+                    True,
+
+                "vcodec":
+                    "unknown",
+
+                "acodec":
+                    "unknown",
+
+                "bitrate":
+                    0,
+
+                "fps":
+                    0
 
             })
 
+        # ====================================================
+        # REMOVE DUPLICATE FORMAT IDs
+        # ====================================================
+
+        unique_formats = {}
+
+        for item in formats_list:
+
+            key = (
+                item["format_id"],
+                item["is_audio"]
+            )
+
+            if key not in unique_formats:
+
+                unique_formats[key] = item
+
+        formats_list = list(
+            unique_formats.values()
+        )
+
+        # ====================================================
+        # SORT
+        # ====================================================
+
+        formats_list.sort(
+            key=lambda x: (
+                0 if not x.get("is_audio") else 1,
+                -safe_int(
+                    x.get("height"),
+                    0
+                ),
+                -safe_int(
+                    x.get("bitrate"),
+                    0
+                )
+            )
+        )
+
+        logger.info(
+            f"EXTRACTION SUCCESS | "
+            f"{title} | "
+            f"{platform} | "
+            f"{len(formats_list)} formats"
+        )
+
         return {
 
-            "title": title,
+            "title":
+                title,
 
-            "thumbnail": thumbnail,
+            "thumbnail":
+                thumbnail,
 
-            "duration": duration,
+            "duration":
+                duration,
 
-            "platform": platform,
+            "duration_seconds":
+                duration,
 
-            "formats": formats_list
+            "duration_formatted":
+                (
+                    f"{duration // 60:02d}:"
+                    f"{duration % 60:02d}"
+                    if duration > 0
+                    else "00:00"
+                ),
+
+            "platform":
+                platform,
+
+            "author":
+                uploader,
+
+            "uploader":
+                uploader,
+
+            "original_url":
+                original_url,
+
+            "url":
+                original_url,
+
+            "formats":
+                formats_list,
+
+            "video_formats":
+                [
+                    x for x in formats_list
+                    if x.get("is_video")
+                ],
+
+            "audio_formats":
+                [
+                    x for x in formats_list
+                    if x.get("is_audio")
+                ]
 
         }
 
@@ -479,12 +936,29 @@ def extract_video_info(data: VideoRequest):
             "EXTRACTION ERROR"
         )
 
+        message = str(e)
+
+        # Make common errors easier for Flutter
+        if "login" in message.lower():
+
+            message = (
+                "This media requires login "
+                "or is not publicly accessible."
+            )
+
+        elif (
+            "sign in" in message.lower()
+            or "bot" in message.lower()
+        ):
+
+            message = (
+                "Platform protection blocked "
+                "this request. Please try another URL."
+            )
+
         raise HTTPException(
-
             status_code=400,
-
-            detail=f"Extraction failed: {str(e)}"
-
+            detail=f"Extraction failed: {message}"
         )
 
 
@@ -512,10 +986,18 @@ def download_video(
 
     try:
 
-        original_url = clean_url(url)
+        original_url = clean_url(
+            url
+        )
+
+        requested_format = safe_str(
+            format_id,
+            "best"
+        )
 
         logger.info(
-            f"DOWNLOAD REQUEST | JOB={job_id}"
+            f"DOWNLOAD REQUEST | "
+            f"JOB={job_id}"
         )
 
         logger.info(
@@ -523,44 +1005,42 @@ def download_video(
         )
 
         logger.info(
-            f"FORMAT={format_id}"
+            f"FORMAT={requested_format}"
         )
 
         # ====================================================
-        # FORMAT SELECTION
+        # FFMPEG CHECK
         # ====================================================
 
-        if (
-            not format_id
-            or format_id.lower() == "best"
-        ):
+        ffmpeg_path = get_ffmpeg_path()
 
-            # Best video + audio.
-            # If source provides combined stream,
-            # yt-dlp will use it.
-            format_selector = (
-                "bv*+ba/b"
-            )
+        logger.info(
+            f"FFMPEG: {ffmpeg_path}"
+        )
 
-        else:
+        # ====================================================
+        # FORMAT SELECTOR
+        # ====================================================
 
-            # User selected a format.
-            # Add audio fallback.
-            format_selector = (
-                f"{format_id}+ba/"
-                f"{format_id}/"
-                "bv*+ba/b"
-            )
+        format_selector = get_format_selector(
+            requested_format
+        )
+
+        logger.info(
+            f"FORMAT SELECTOR: "
+            f"{format_selector}"
+        )
+
+        # ====================================================
+        # OUTPUT
+        # ====================================================
 
         output_template = os.path.join(
-
             temp_dir,
-
             f"{job_id}.%(ext)s"
-
         )
 
-        opts = get_extract_options()
+        opts = get_base_options()
 
         opts.update({
 
@@ -570,110 +1050,196 @@ def download_video(
             "outtmpl":
                 output_template,
 
-            "merge_output_format":
-                "mp4",
-
             "noplaylist":
                 True,
 
-            "overwrites":
-                True,
-
-            "continuedl":
-                False,
+            "merge_output_format":
+                "mp4",
 
             "retries":
-                5,
+                10,
 
             "fragment_retries":
+                10,
+
+            "extractor_retries":
+                5,
+
+            "file_access_retries":
                 5,
 
         })
 
         # ====================================================
-        # DOWNLOAD WITH YT-DLP
+        # FFMPEG
         # ====================================================
+
+        if ffmpeg_path:
+
+            opts["ffmpeg_location"] = (
+                os.path.dirname(ffmpeg_path)
+            )
+
+        else:
+
+            # If no ffmpeg, try single-file formats.
+            #
+            # But for best quality videos where video
+            # and audio are separate, merging is impossible.
+            #
+            # We don't immediately fail because some
+            # platforms provide combined streams.
+            logger.warning(
+                "FFmpeg NOT FOUND. "
+                "Only single-file streams may work."
+            )
+
+            # Force combined stream as fallback
+            if requested_format.lower() in {
+                "best",
+                "auto",
+                "default",
+                ""
+            }:
+
+                opts["format"] = (
+                    "b[ext=mp4]/"
+                    "b/"
+                    "best"
+                )
+
+        # ====================================================
+        # DOWNLOAD
+        # ====================================================
+
+        logger.info(
+            f"YT-DLP START | JOB={job_id}"
+        )
 
         with yt_dlp.YoutubeDL(opts) as ydl:
 
             info = ydl.extract_info(
-
                 original_url,
-
                 download=True
-
             )
 
-            downloaded_file = (
-                ydl.prepare_filename(info)
+        if not info:
+
+            raise HTTPException(
+                status_code=404,
+                detail=
+                "Could not extract media from this URL."
             )
 
         # ====================================================
-        # FIND FINAL MP4
+        # FIND DOWNLOADED FILES
         # ====================================================
 
         possible_files = []
 
-        for filename in os.listdir(temp_dir):
+        for root, dirs, files in os.walk(
+            temp_dir
+        ):
 
-            full_path = os.path.join(
-                temp_dir,
-                filename
-            )
+            for filename in files:
 
-            if os.path.isfile(full_path):
-
-                possible_files.append(
-                    full_path
+                full_path = os.path.join(
+                    root,
+                    filename
                 )
+
+                if os.path.isfile(
+                    full_path
+                ):
+
+                    possible_files.append(
+                        full_path
+                    )
+
+        # Remove tiny/invalid files
+        possible_files = [
+            f for f in possible_files
+            if os.path.getsize(f) > 1024
+        ]
 
         if not possible_files:
 
             raise HTTPException(
-
                 status_code=500,
-
                 detail=
-                "Download completed but file was not created"
-
+                "yt-dlp completed but no media file was created."
             )
 
-        # Prefer MP4
+        # ====================================================
+        # SELECT FINAL FILE
+        # ====================================================
+
         mp4_files = [
-
             f for f in possible_files
-
             if f.lower().endswith(".mp4")
-
         ]
 
         if mp4_files:
 
-            final_file = mp4_files[0]
+            # Largest MP4
+            final_file = max(
+                mp4_files,
+                key=os.path.getsize
+            )
 
         else:
 
-            final_file = possible_files[0]
+            # Largest available media
+            final_file = max(
+                possible_files,
+                key=os.path.getsize
+            )
 
-        if not os.path.exists(final_file):
+        # ====================================================
+        # FILE CHECK
+        # ====================================================
+
+        if not os.path.exists(
+            final_file
+        ):
 
             raise HTTPException(
-
                 status_code=500,
-
-                detail="Downloaded file not found"
-
+                detail=
+                "Downloaded media file not found."
             )
 
         file_size = os.path.getsize(
             final_file
         )
 
-        logger.info(
-            f"DOWNLOAD COMPLETE | "
-            f"JOB={job_id} | "
-            f"SIZE={file_size}"
+        if file_size < 1024:
+
+            raise HTTPException(
+                status_code=500,
+                detail=
+                "Downloaded file is empty or invalid."
+            )
+
+        # ====================================================
+        # EXTENSION
+        # ====================================================
+
+        actual_ext = (
+            os.path.splitext(
+                final_file
+            )[1]
+            .lower()
+            .replace(".", "")
         )
+
+        if not actual_ext:
+
+            actual_ext = "mp4"
+
+        # ====================================================
+        # TITLE
+        # ====================================================
 
         title = safe_filename(
             info.get(
@@ -682,23 +1248,77 @@ def download_video(
             )
         )
 
-        download_name = (
-            f"{title}.mp4"
+        # Avoid duplicate extension
+        title = re.sub(
+            r"\.(mp4|webm|mkv|mov|avi|m4a|mp3)$",
+            "",
+            title,
+            flags=re.IGNORECASE
         )
+
+        # ====================================================
+        # MIME
+        # ====================================================
+
+        if actual_ext == "mp4":
+
+            media_type = "video/mp4"
+
+        elif actual_ext == "webm":
+
+            media_type = "video/webm"
+
+        elif actual_ext == "mkv":
+
+            media_type = "video/x-matroska"
+
+        elif actual_ext == "m4a":
+
+            media_type = "audio/mp4"
+
+        elif actual_ext == "mp3":
+
+            media_type = "audio/mpeg"
+
+        else:
+
+            media_type = "application/octet-stream"
+
+        download_name = (
+            f"{title}.{actual_ext}"
+        )
+
+        logger.info(
+            f"DOWNLOAD COMPLETE | "
+            f"JOB={job_id} | "
+            f"SIZE={file_size} | "
+            f"FILE={final_file}"
+        )
+
+        # ====================================================
+        # RESPONSE
+        # ====================================================
 
         return FileResponse(
 
             path=final_file,
 
-            media_type="video/mp4",
+            media_type=media_type,
 
-            filename=download_name,
-
-            background=None
+            filename=download_name
 
         )
 
     except HTTPException:
+
+        # Cleanup
+        try:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True
+            )
+        except Exception:
+            pass
 
         raise
 
@@ -708,21 +1328,71 @@ def download_video(
             f"DOWNLOAD ERROR | JOB={job_id}"
         )
 
+        message = str(e)
+
+        # ====================================================
+        # FRIENDLY ERRORS
+        # ====================================================
+
+        if (
+            "ffmpeg" in message.lower()
+            or "merging" in message.lower()
+        ):
+
+            message = (
+                "This video requires FFmpeg "
+                "to merge video and audio streams. "
+                "Please install FFmpeg on the server."
+            )
+
+        elif (
+            "requested format" in message.lower()
+            or "format is not available" in message.lower()
+        ):
+
+            message = (
+                "The selected quality is not available "
+                "for this video. Please select another quality."
+            )
+
+        elif (
+            "sign in" in message.lower()
+            or "login" in message.lower()
+        ):
+
+            message = (
+                "This video requires login "
+                "or is not publicly accessible."
+            )
+
+        elif (
+            "bot" in message.lower()
+            or "confirm" in message.lower()
+        ):
+
+            message = (
+                "The platform blocked this request. "
+                "Please try another video."
+            )
+
         raise HTTPException(
-
             status_code=500,
-
             detail=
-            f"Video download failed: {str(e)}"
-
+            f"Video download failed: {message}"
         )
 
+    # NOTE:
+    # FileResponse finishes reading the file after returning.
+    # Therefore temp directory should not be deleted here.
+
 
 # ============================================================
-# ERROR HANDLERS
+# ERROR HANDLER
 # ============================================================
 
-@app.exception_handler(HTTPException)
+@app.exception_handler(
+    HTTPException
+)
 async def http_exception_handler(
     request,
     exc
@@ -734,9 +1404,11 @@ async def http_exception_handler(
 
         content={
 
-            "status": "error",
+            "status":
+                "error",
 
-            "detail": str(exc.detail),
+            "detail":
+                str(exc.detail),
 
             "status_code":
                 exc.status_code
@@ -746,7 +1418,9 @@ async def http_exception_handler(
     )
 
 
-@app.exception_handler(Exception)
+@app.exception_handler(
+    Exception
+)
 async def general_exception_handler(
     request,
     exc
@@ -762,12 +1436,14 @@ async def general_exception_handler(
 
         content={
 
-            "status": "error",
+            "status":
+                "error",
 
             "detail":
                 "Internal server error",
 
-            "status_code": 500
+            "status_code":
+                500
 
         }
 
@@ -775,7 +1451,7 @@ async def general_exception_handler(
 
 
 # ============================================================
-# LOCAL SERVER
+# SERVER
 # ============================================================
 
 if __name__ == "__main__":
@@ -795,6 +1471,8 @@ if __name__ == "__main__":
 
         host="0.0.0.0",
 
-        port=port
+        port=port,
+
+        log_level="info"
 
     )
