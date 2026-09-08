@@ -33,9 +33,9 @@ logger = logging.getLogger("video-downloader")
 # ============================================================
 
 app = FastAPI(
-    title="Universal Social Video Downloader & SSTE Solar API",
-    version="3.1.0",
-    description="Universal social media video downloader with Inverter IoT Gateway"
+    title="Universal Social Video Downloader & SSTE Multi-Inverter Gateway",
+    version="3.2.0",
+    description="Universal social media video downloader with Multi-Device Inverter IoT Gateway"
 )
 
 app.add_middleware(
@@ -48,11 +48,12 @@ app.add_middleware(
 
 
 # ============================================================
-# IN-MEMORY STORAGE FOR INVERTER GATEWAY
+# MULTI-DEVICE IN-MEMORY REGISTRY & STORAGE
 # ============================================================
 
-inverter_live_data: Dict[str, Any] = {}
-inverter_pending_commands: Dict[str, Any] = {}
+registered_devices: set = set()
+devices_live_data: Dict[str, Any] = {}
+devices_pending_commands: Dict[str, Any] = {}
 
 
 # ============================================================
@@ -287,43 +288,102 @@ def get_format_selector(format_id: str) -> str:
 
 
 # ============================================================
-# INVERTER IOT GATEWAY ENDPOINTS (ESP32 & FLUTTER)
+# MULTI-DEVICE INVERTER IOT GATEWAY ENDPOINTS
 # ============================================================
 
-@app.put("/api/live")
-async def update_inverter_live(request: Request):
-    global inverter_live_data
+# 1. Duplicate ID Check (App new device create karne se pehle check karegi)
+@app.get("/api/device/check/{device_id}")
+async def check_device_id_availability(device_id: str):
+    clean_id = device_id.strip()
+    if clean_id in registered_devices or clean_id in devices_live_data:
+        return {
+            "available": False,
+            "device_id": clean_id,
+            "message": "Already Exists! Koi doosra naam muntakhib karein."
+        }
+    return {
+        "available": True,
+        "device_id": clean_id,
+        "message": "Device ID is available."
+    }
+
+
+# 2. Get List of All Active Devices (App dropdown ya search ke liye)
+@app.get("/api/devices")
+async def list_all_devices():
+    all_devs = sorted(list(registered_devices.union(set(devices_live_data.keys()))))
+    return {
+        "count": len(all_devs),
+        "devices": all_devs
+    }
+
+
+# 3. Dynamic Telemetry Push (Har ESP32 apni Device ID par PUT bhejega)
+@app.put("/api/{device_id}/live")
+async def update_device_live(device_id: str, request: Request):
+    global devices_live_data, registered_devices
+    clean_id = device_id.strip()
     try:
         payload = await request.json()
-        inverter_live_data = payload
-        inverter_live_data["server_timestamp"] = int(time.time() * 1000)
-        return {"status": "success", "message": "Telemetry updated"}
+        registered_devices.add(clean_id)
+        devices_live_data[clean_id] = {
+            **payload,
+            "device_id": clean_id,
+            "server_timestamp": int(time.time() * 1000)
+        }
+        return {"status": "success", "device_id": clean_id, "message": "Telemetry updated"}
     except Exception as err:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(err)}")
 
 
-@app.get("/api/live")
-async def get_inverter_live():
-    return inverter_live_data
+# 4. Dynamic Telemetry Read (App specific Device ID ka data fetch karegi)
+@app.get("/api/{device_id}/live")
+async def get_device_live(device_id: str):
+    clean_id = device_id.strip()
+    if clean_id not in devices_live_data:
+        raise HTTPException(status_code=404, detail=f"Device '{clean_id}' not found or offline.")
+    return devices_live_data[clean_id]
 
 
-@app.get("/api/command")
-async def poll_inverter_command():
-    global inverter_pending_commands
-    cmd = inverter_pending_commands
-    inverter_pending_commands = {}  # Clear after read
+# 5. ESP32 Polls Commands for its Specific Device ID
+@app.get("/api/{device_id}/command")
+async def poll_device_command(device_id: str):
+    global devices_pending_commands
+    clean_id = device_id.strip()
+    cmd = devices_pending_commands.get(clean_id, {})
+    devices_pending_commands[clean_id] = {}  # Clear after read
     return cmd
 
 
-@app.post("/api/command")
-async def queue_inverter_command(request: Request):
-    global inverter_pending_commands
+# 6. App Posts Command for Specific Device ID
+@app.post("/api/{device_id}/command")
+async def queue_device_command(device_id: str, request: Request):
+    global devices_pending_commands
+    clean_id = device_id.strip()
     try:
         cmd = await request.json()
-        inverter_pending_commands = cmd
-        return {"status": "queued", "command": cmd}
+        devices_pending_commands[clean_id] = cmd
+        return {"status": "queued", "device_id": clean_id, "command": cmd}
     except Exception as err:
         raise HTTPException(status_code=400, detail=f"Invalid Command JSON: {str(err)}")
+
+
+# Fallback Single-Device Endpoints (Backward Compatibility)
+@app.put("/api/live")
+async def legacy_update_inverter_live(request: Request):
+    return await update_device_live("default", request)
+
+@app.get("/api/live")
+async def legacy_get_inverter_live():
+    return devices_live_data.get("default", {})
+
+@app.get("/api/command")
+async def legacy_poll_inverter_command():
+    return await poll_device_command("default")
+
+@app.post("/api/command")
+async def legacy_queue_inverter_command(request: Request):
+    return await queue_device_command("default", request)
 
 
 # ============================================================
@@ -335,20 +395,23 @@ def root():
     ffmpeg = get_ffmpeg_path()
     return {
         "status": "online",
-        "service": "Universal Social Video Downloader & SSTE Inverter API",
-        "version": "3.1.0",
+        "service": "Universal Social Video Downloader & SSTE Multi-Inverter API",
+        "version": "3.2.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
+        "connected_inverters": len(devices_live_data),
         "endpoints": [
             "POST /api/extract",
             "GET /api/download",
             "GET /api/stream",
             "GET /api/health",
-            "PUT /api/live (ESP32 Inverter Push)",
-            "GET /api/live (App Inverter Read)",
-            "GET /api/command (ESP32 Poll)",
-            "POST /api/command (App Command Post)"
+            "GET /api/device/check/{device_id} (Check duplicate name)",
+            "GET /api/devices (List all devices)",
+            "PUT /api/{device_id}/live (Dynamic ESP32 Push)",
+            "GET /api/{device_id}/live (App Inverter Read)",
+            "GET /api/{device_id}/command (ESP32 Poll)",
+            "POST /api/{device_id}/command (App Command Post)"
         ]
     }
 
@@ -359,9 +422,10 @@ def health():
     return {
         "status": "ok",
         "service": "video-downloader-backend",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "yt_dlp": yt_dlp.version.__version__,
-        "ffmpeg": bool(ffmpeg)
+        "ffmpeg": bool(ffmpeg),
+        "active_devices": list(devices_live_data.keys())
     }
 
 
