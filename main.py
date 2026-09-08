@@ -35,8 +35,8 @@ logger = logging.getLogger("video-downloader")
 
 app = FastAPI(
     title="Universal Social Video Downloader & SSTE Multi-Inverter Gateway",
-    version="3.4.0",
-    description="Universal social media video downloader with Admin-Guarded Multi-Device Inverter IoT Gateway & Midnight Archive"
+    version="3.5.0",
+    description="Universal social media video downloader with Admin-Guarded Multi-Device Inverter IoT Gateway, Midnight Archive & Reset-All"
 )
 
 app.add_middleware(
@@ -441,6 +441,38 @@ async def admin_release_device(device_id: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Device '{clean_id}' not found on server registry.")
 
 
+# 9. UNIVERSAL CLEAR ALL RESET: Flush All Energy, Peaks and History
+@app.delete("/api/admin/device/{device_id}/reset-all")
+async def admin_reset_all_device_data(device_id: str, request: Request):
+    global devices_live_data, device_daily_archives, devices_pending_commands
+    clean_id = device_id.strip()
+
+    admin_key = request.headers.get("X-Admin-Key")
+    if admin_key != ADMIN_MASTER_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized: Admin key required to reset all data.")
+
+    if clean_id in devices_live_data:
+        devices_live_data[clean_id]["solarEnergy"] = 0.0
+        devices_live_data[clean_id]["loadEnergy"] = 0.0
+        devices_live_data[clean_id]["importEnergy"] = 0.0
+        devices_live_data[clean_id]["exportEnergy"] = 0.0
+        devices_live_data[clean_id]["battChgEnergy"] = 0.0
+        devices_live_data[clean_id]["battDisEnergy"] = 0.0
+        devices_live_data[clean_id]["solarPeak"] = 0.0
+
+    if clean_id in device_daily_archives:
+        device_daily_archives[clean_id] = []
+
+    devices_pending_commands[clean_id] = {"command": "CLEAR_ALL_RESET", "target": "all"}
+
+    logger.info(f"FULL SYSTEM RESET EXECUTED FOR: {clean_id}")
+    return {
+        "status": "success",
+        "device_id": clean_id,
+        "message": "All energy counters, peaks, and history cleared successfully across Cloud and Hardware."
+    }
+
+
 # Fallback Single-Device Endpoints
 @app.put("/api/live")
 async def legacy_update_inverter_live(request: Request):
@@ -469,7 +501,7 @@ def root():
     return {
         "status": "online",
         "service": "Universal Social Video Downloader & SSTE Multi-Inverter API",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
@@ -486,7 +518,8 @@ def root():
             "GET /api/{device_id}/archive",
             "GET /api/{device_id}/command",
             "POST /api/{device_id}/command",
-            "DELETE /api/admin/device/{device_id}"
+            "DELETE /api/admin/device/{device_id}",
+            "DELETE /api/admin/device/{device_id}/reset-all"
         ]
     }
 
@@ -497,7 +530,7 @@ def health():
     return {
         "status": "ok",
         "service": "video-downloader-backend",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "active_devices": list(devices_live_data.keys())
