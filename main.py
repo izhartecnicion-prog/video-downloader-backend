@@ -34,8 +34,8 @@ logger = logging.getLogger("video-downloader")
 
 app = FastAPI(
     title="Universal Social Video Downloader & SSTE Multi-Inverter Gateway",
-    version="3.2.0",
-    description="Universal social media video downloader with Multi-Device Inverter IoT Gateway"
+    version="3.3.0",
+    description="Universal social media video downloader with Admin-Guarded Multi-Device Inverter IoT Gateway"
 )
 
 app.add_middleware(
@@ -48,8 +48,10 @@ app.add_middleware(
 
 
 # ============================================================
-# MULTI-DEVICE IN-MEMORY REGISTRY & STORAGE
+# MULTI-DEVICE IN-MEMORY REGISTRY & SECURITY CONFIG
 # ============================================================
+
+ADMIN_MASTER_KEY = "SAJJAD_ADMIN_786"
 
 registered_devices: set = set()
 devices_live_data: Dict[str, Any] = {}
@@ -299,7 +301,7 @@ async def check_device_id_availability(device_id: str):
         return {
             "available": False,
             "device_id": clean_id,
-            "message": "Already Exists! Koi doosra naam muntakhib karein."
+            "message": "Already Exists! Yeh device pehle se bound hai. Admin se rabta karein."
         }
     return {
         "available": True,
@@ -368,6 +370,40 @@ async def queue_device_command(device_id: str, request: Request):
         raise HTTPException(status_code=400, detail=f"Invalid Command JSON: {str(err)}")
 
 
+# 7. ADMIN EXCLUSIVE: Release / Delete Device Lock from Server Registry
+@app.delete("/api/admin/device/{device_id}")
+async def admin_release_device(device_id: str, request: Request):
+    global registered_devices, devices_live_data, devices_pending_commands
+    clean_id = device_id.strip()
+
+    # Verify Admin Master Key from Request Header
+    admin_key = request.headers.get("X-Admin-Key")
+    if admin_key != ADMIN_MASTER_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized: Only Admin (Mr. Sajjad) can release bound hardware.")
+
+    was_registered = clean_id in registered_devices
+    was_live = clean_id in devices_live_data
+
+    if clean_id in registered_devices:
+        registered_devices.remove(clean_id)
+
+    if clean_id in devices_live_data:
+        del devices_live_data[clean_id]
+
+    if clean_id in devices_pending_commands:
+        del devices_pending_commands[clean_id]
+
+    if was_registered or was_live:
+        logger.info(f"ADMIN ACTION: Device '{clean_id}' successfully released and deleted from server registry.")
+        return {
+            "status": "success",
+            "device_id": clean_id,
+            "message": f"Device '{clean_id}' released successfully. Already Exists lock cleared."
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"Device '{clean_id}' not found on server registry.")
+
+
 # Fallback Single-Device Endpoints (Backward Compatibility)
 @app.put("/api/live")
 async def legacy_update_inverter_live(request: Request):
@@ -396,7 +432,7 @@ def root():
     return {
         "status": "online",
         "service": "Universal Social Video Downloader & SSTE Multi-Inverter API",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
@@ -411,7 +447,8 @@ def root():
             "PUT /api/{device_id}/live (Dynamic ESP32 Push)",
             "GET /api/{device_id}/live (App Inverter Read)",
             "GET /api/{device_id}/command (ESP32 Poll)",
-            "POST /api/{device_id}/command (App Command Post)"
+            "POST /api/{device_id}/command (App Command Post)",
+            "DELETE /api/admin/device/{device_id} (Admin Unbind Hardware)"
         ]
     }
 
@@ -422,7 +459,7 @@ def health():
     return {
         "status": "ok",
         "service": "video-downloader-backend",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "active_devices": list(devices_live_data.keys())
