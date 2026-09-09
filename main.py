@@ -474,14 +474,14 @@ async def admin_reset_all_device_data(device_id: str, request: Request):
 
 
 # ============================================================
-# FIRMWARE AUTO-UPDATE CHECK ENDPOINT
+# FIRMWARE AUTO-UPDATE CHECK ENDPOINT (Direct Cloud OTA v1.20)
 # ============================================================
 
 @app.get("/api/firmware-check")
 def check_firmware_update():
     return {
-        "latest_version": "v1.20",  # Jab bhi naya update release karna ho, yahan version change kar dein
-        "firmware_url": "https://github.com/izhartecnicion-prog/video-downloader-backend/releases/download/v1.20/TEST_TIGER.ino.bin" # GitHub raw .bin link
+        "latest_version": "v1.20",  
+        "firmware_url": "https://github.com/izhartecnicion-prog/video-downloader-backend/releases/download/v1.20/TEST_TIGER.ino.bin" 
     }
 
 
