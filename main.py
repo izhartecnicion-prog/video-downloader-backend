@@ -473,6 +473,18 @@ async def admin_reset_all_device_data(device_id: str, request: Request):
     }
 
 
+# ============================================================
+# FIRMWARE AUTO-UPDATE CHECK ENDPOINT
+# ============================================================
+
+@app.get("/api/firmware-check")
+def check_firmware_update():
+    return {
+        "latest_version": "v1.19",  # Jab bhi naya update release karna ho, yahan version change kar dein
+        "firmware_url": "https://raw.githubusercontent.com/your-username/your-repo/main/firmware.bin" # GitHub raw .bin link
+    }
+
+
 # Fallback Single-Device Endpoints
 @app.put("/api/live")
 async def legacy_update_inverter_live(request: Request):
@@ -519,7 +531,8 @@ def root():
             "GET /api/{device_id}/command",
             "POST /api/{device_id}/command",
             "DELETE /api/admin/device/{device_id}",
-            "DELETE /api/admin/device/{device_id}/reset-all"
+            "DELETE /api/admin/device/{device_id}/reset-all",
+            "GET /api/firmware-check"
         ]
     }
 
