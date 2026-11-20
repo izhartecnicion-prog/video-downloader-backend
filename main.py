@@ -20,6 +20,7 @@ import secrets
 import smtplib
 import threading
 import urllib.request
+import base64
 from email.message import EmailMessage
 from datetime import datetime
 
@@ -558,7 +559,8 @@ def root():
             "GET /api/auth/status",
             "POST /api/auth/forgot-password",
             "POST /api/auth/reset-password",
-            "POST /api/auth/change-password"
+            "POST /api/auth/change-password",
+            "POST /api/v1/chat  (Firmware Studio AI chat)"
         ]
     }
 
@@ -572,7 +574,9 @@ def health():
         "version": "4.0.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
-        "active_devices": list(devices_live_data.keys())
+        "active_devices": list(devices_live_data.keys()),
+        "gemini_configured": bool(os.environ.get("GEMINI_API_KEY")),
+        "gemini_model": GEMINI_MODEL
     }
 
 
@@ -1331,6 +1335,332 @@ def download_video(
         shutil.rmtree(temp_dir, ignore_errors=True)
         message = str(e)
         raise HTTPException(status_code=500, detail=f"Video download failed: {message}")
+
+
+# ============================================================
+# FIRMWARE STUDIO - AI CHAT (GEMINI)
+# Render > Environment: GEMINI_API_KEY (zaruri), GEMINI_MODEL (optional)
+# ============================================================
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "30000"))
+
+_gemini_client = None
+_gemini_lock = threading.Lock()
+
+
+def get_gemini_client():
+    """Lazy init: google-genai na bhi ho to baaki service (downloader/inverter) chalti rahe."""
+    global _gemini_client
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY Render Environment me set nahi hai.")
+    with _gemini_lock:
+        if _gemini_client is None:
+            try:
+                from google import genai
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"google-genai install nahi hai. requirements.txt me 'google-genai' add karo. ({e})"
+                )
+            _gemini_client = genai.Client(api_key=api_key)
+        return _gemini_client
+
+
+# ---------- emoji / mojibake sanitizer (HTML numeric entities) ----------
+
+_EMOJI_ENTITIES = {
+    "\U0001F4E1": "&#128225;",
+    "\U0001F39B": "&#127899;&#65039;",
+    "\u2600": "&#9728;&#65039;",
+    "\U0001F50B": "&#128267;",
+    "\U0001F3E0": "&#127968;",
+    "\U0001F50C": "&#128268;",
+    "\U0001F4CD": "&#128205;",
+    "\u26A1": "&#9889;",
+    "\U0001F504": "&#128260;",
+    "\u2699": "&#9881;&#65039;",
+    "\u2715": "&#10005;",
+    "\u274C": "&#10005;",
+    "\u2713": "&#10003;",
+    "\u2714": "&#10003;",
+    "\u2139": "&#8505;&#65039;",
+    "\U0001F4E5": "&#128229;",
+    "\u2022": "&#8226;",
+    "\u00B0": "&#176;",
+    "\U0001F5D1": "&#128465;&#65039;",
+    "\u2B05": "&#11013;&#65039;",
+    "\U0001F50D": "&#128269;",
+    "\u26A0": "&#9888;&#65039;",
+}
+
+
+def _make_mojibake(text: str, codec: str) -> str:
+    out = []
+    for b in text.encode("utf-8"):
+        try:
+            out.append(bytes([b]).decode(codec))
+        except Exception:
+            out.append(chr(b))
+    return "".join(out)
+
+
+def _build_sanitizer_pairs():
+    pairs = {}
+    for ch, entity in _EMOJI_ENTITIES.items():
+        for variant in (ch + "\ufe0f", ch):
+            pairs[variant] = entity
+            for codec in ("cp1252", "latin-1"):
+                moji = _make_mojibake(variant, codec)
+                if moji != variant:
+                    pairs[moji] = entity
+    # lambay pattern pehle replace hon (variation selector wale)
+    return sorted(pairs.items(), key=lambda kv: len(kv[0]), reverse=True)
+
+
+_SANITIZER_PAIRS = _build_sanitizer_pairs()
+
+
+def clean_mojibake_and_emojis(code: str) -> str:
+    if not code:
+        return code
+    for pattern, entity in _SANITIZER_PAIRS:
+        if pattern in code:
+            code = code.replace(pattern, entity)
+    return code
+
+
+# ---------- request models ----------
+
+class ChatFile(BaseModel):
+    name: str
+    content: str
+
+
+class ChatImage(BaseModel):
+    mime: str = "image/png"
+    b64: str
+
+
+class ChatTurn(BaseModel):
+    role: str  # "user" | "ai"
+    text: str
+
+
+class ChatRequest(BaseModel):
+    mcu: str = "ESP32"
+    message: str
+    files: List[ChatFile] = []
+    images: List[ChatImage] = []
+    history: List[ChatTurn] = []
+
+
+MASTER_PROMPT = """
+You are FIRMWARE STUDIO MASTER AI: a senior embedded engineer (ESP32, ESP8266,
+Arduino, solar/inverter monitoring, Firebase, HTML-in-.ino dashboards).
+You TALK with the developer like a human colleague, in the same language mix
+they use (Roman Urdu / English). You understand, explain, ask, diagnose, resolve.
+
+INPUT: user message, chat history, up to 4 .ino files (each with a name),
+optional screenshots / compiler logs.
+
+HOW YOU WORK
+1. Read EVERY file fully before answering. Map functions, pins, protocol, HTML blocks.
+2. If the user only asks a question ("ye function kya karta hai?", "kya ye sahi hai?"),
+   ANSWER it in "reply" and return no patches.
+3. If the user wants a change, explain in 2-5 short lines WHAT you found and WHAT you
+   will change, then give surgical patches. Never rewrite whole files.
+4. Multi-file: user may say "file A se function X copy karke file B me replace karo".
+   Read X from file A exactly, then patch file B. Every patch names its target "file".
+5. You can ADD a function (find = a unique anchor line, replace = anchor + new code),
+   REPLACE a function (find = the whole old function, copied exactly), or DELETE one
+   (replace = "").
+6. If something is genuinely ambiguous, ask ONE short question in "reply" and return
+   no patches. Otherwise decide and act.
+7. Check compile-readiness: braces, semicolons, includes, duplicate definitions,
+   missing prototypes, wrong pins for the MCU, blocking delay() in loop.
+8. Zero Code Loss: untouched lines are never retyped. "find" must be copied
+   character-for-character from the file (same spaces, same indentation) and must be
+   UNIQUE in that file. If a line repeats, include a neighbouring line to make it unique.
+9. ICONS: never output raw emoji. Use only: sun &#9728;&#65039; battery &#128267;
+   antenna &#128225; sliders &#127899;&#65039; home &#127968; plug &#128268;
+   pin &#128205; bolt &#9889; refresh &#128260; gear &#9881;&#65039; check &#10003;
+   close &#10005; info &#8505;&#65039; inbox &#128229; bullet &#8226; degree &#176;
+   trash &#128465;&#65039; left &#11013;&#65039;. Existing entities in the file are copied
+   unchanged. Garbled sequences (mojibake, starting with characters like the Latin
+   letters with accents seen in broken emoji) found in the input are a bug: fix them.
+10. ESP32<->ESP8266 port rules: WiFi.h<->ESP8266WiFi.h, WebServer.h<->ESP8266WebServer.h,
+   HTTPClient.h<->ESP8266HTTPClient.h, ESPmDNS.h<->ESP8266mDNS.h,
+   Serial2(16,17)<->SoftwareSerial(3,1), MAX_HISTORY 288<->144,
+   client.setBufferSizes(512,512) on 8266. Nothing else changes.
+
+OUTPUT: ONLY valid JSON, no markdown fences:
+{
+ "reply": "human explanation / answer / question for the chat page",
+ "patches": [ {"file": "name.ino", "find": "...", "replace": "...", "why": "short reason"} ],
+ "report": {
+    "summary": "one paragraph",
+    "issues_found": [ {"file":"","line_hint":"","problem":"","fix":""} ],
+    "compile_ready": true
+ },
+ "alerts": [ {"level": "error|warning|info", "file": "", "message": ""} ]
+}
+Always include all four keys (empty list / empty string if nothing).
+"""
+
+
+def _parse_ai_json(text: str) -> Dict[str, Any]:
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    try:
+        return json.loads(t)
+    except Exception:
+        start, end = t.find("{"), t.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(t[start:end + 1])
+        raise
+
+
+def _validate_patches(patches: Any, files: List[ChatFile]):
+    by_name = {f.name: f.content for f in files}
+    ok: List[Dict[str, Any]] = []
+    alerts: List[Dict[str, Any]] = []
+
+    if not isinstance(patches, list):
+        return ok, alerts
+
+    for p in patches:
+        if not isinstance(p, dict):
+            continue
+        fname = safe_str(p.get("file"))
+        find = p.get("find")
+        src = by_name.get(fname)
+
+        if src is None:
+            alerts.append({"level": "error", "file": fname,
+                           "message": "Patch target file nahi mili. Patch skip hua."})
+            continue
+        if not isinstance(find, str) or not find:
+            alerts.append({"level": "error", "file": fname,
+                           "message": "Patch ka 'find' khali hai. Patch skip hua."})
+            continue
+
+        count = src.count(find)
+        if count != 1:
+            alerts.append({"level": "error", "file": fname,
+                           "message": f"'find' text file me {count} baar mila (sirf 1 baar chahiye). Patch skip hua."})
+            continue
+
+        ok.append(p)
+
+    return ok, alerts
+
+
+def _call_gemini(client, model: str, contents):
+    from google.genai import types
+    return client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=MASTER_PROMPT,
+            temperature=0.2,
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+            response_mime_type="application/json",
+        ),
+    )
+
+
+# NOTE: plain "def" (async nahi) taake lambi AI call inverter live endpoints ko block na kare.
+@app.post("/api/v1/chat")
+@app.post("/api/chat")
+def firmware_chat(req: ChatRequest):
+    if len(req.files) > 4:
+        raise HTTPException(status_code=400, detail="Ek waqt me maximum 4 files allowed hain.")
+    if not req.message.strip() and not req.files and not req.images:
+        raise HTTPException(status_code=400, detail="Message ya file dena zaruri hai.")
+
+    client = get_gemini_client()
+
+    from google.genai import types
+
+    parts = []
+    for h in req.history[-12:]:
+        parts.append(types.Part.from_text(text=f"[{h.role.upper()}]: {h.text}"))
+
+    for f in req.files:
+        parts.append(types.Part.from_text(
+            text=f"=== FILE: {f.name} ===\n{f.content}\n=== END FILE: {f.name} ==="
+        ))
+
+    for im in req.images:
+        try:
+            raw = base64.b64decode(im.b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Screenshot ka base64 data kharab hai.")
+        parts.append(types.Part.from_bytes(data=raw, mime_type=im.mime or "image/png"))
+
+    parts.append(types.Part.from_text(text=f"[TARGET MCU]: {req.mcu}\n[USER]: {req.message}"))
+    contents = [types.Content(role="user", parts=parts)]
+
+    used_model = GEMINI_MODEL
+    try:
+        try:
+            resp = _call_gemini(client, used_model, contents)
+        except Exception as primary_error:
+            if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != used_model:
+                logger.warning(f"MODEL {used_model} FAILED ({primary_error}); fallback {GEMINI_FALLBACK_MODEL}")
+                used_model = GEMINI_FALLBACK_MODEL
+                resp = _call_gemini(client, used_model, contents)
+            else:
+                raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("GEMINI CHAT ERROR")
+        raise HTTPException(status_code=500, detail=f"AI engine failed: {e}")
+
+    raw_text = ""
+    try:
+        raw_text = resp.text or ""
+    except Exception:
+        raw_text = ""
+
+    parse_alerts: List[Dict[str, Any]] = []
+    try:
+        data = _parse_ai_json(raw_text)
+        if not isinstance(data, dict):
+            raise ValueError("AI response object nahi hai")
+    except Exception:
+        data = {"reply": raw_text or "AI ne khali jawab diya. Dobara try karo.",
+                "patches": [], "report": {}, "alerts": []}
+        parse_alerts.append({"level": "warning", "file": "",
+                             "message": "AI ka jawab JSON format me nahi tha, isliye patches nahi bane."})
+
+    patches, bad = _validate_patches(data.get("patches", []), req.files)
+    for p in patches:
+        p["replace"] = clean_mojibake_and_emojis(safe_str(p.get("replace"), "") if p.get("replace") is not None else "")
+        p["why"] = safe_str(p.get("why"), "")
+
+    ai_alerts = data.get("alerts", [])
+    if not isinstance(ai_alerts, list):
+        ai_alerts = []
+
+    report = data.get("report", {})
+    if not isinstance(report, dict):
+        report = {}
+
+    return {
+        "status": "success",
+        "model": used_model,
+        "reply": safe_str(data.get("reply"), ""),
+        "patches": patches,
+        "report": report,
+        "alerts": ai_alerts + bad + parse_alerts,
+    }
 
 
 # ============================================================
