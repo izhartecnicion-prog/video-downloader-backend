@@ -7,6 +7,7 @@ import yt_dlp
 import logging
 import tempfile
 import os
+import json
 import uuid
 import re
 import shutil
@@ -15,6 +16,9 @@ import time
 from datetime import datetime
 
 from typing import Optional, List, Dict, Any
+
+import firebase_admin
+from firebase_admin import auth as fb_auth, credentials, firestore as fb_firestore
 
 
 # ============================================================
@@ -64,11 +68,42 @@ device_daily_archives: Dict[str, list] = {}
 
 
 # ============================================================
+# FIREBASE ADMIN SDK HELPER (PASSWORD RESET WITH OTP)
+# ============================================================
+
+def init_fb_admin() -> bool:
+    if firebase_admin._apps:
+        return True
+
+    raw_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw_json:
+        logger.warning("[FirebaseAdmin] FIREBASE_SERVICE_ACCOUNT_JSON environment variable is not set")
+        return False
+
+    try:
+        cert_dict = json.loads(raw_json)
+        cred = credentials.Certificate(cert_dict)
+        firebase_admin.initialize_app(cred)
+        logger.info("[FirebaseAdmin] Initialized successfully")
+        return True
+    except Exception as e:
+        logger.exception(f"[FirebaseAdmin] Initialization failed: {e}")
+        return False
+
+
+# ============================================================
 # MODELS
 # ============================================================
 
 class VideoRequest(BaseModel):
     url: str
+
+
+class ResetPasswordWithOtpRequest(BaseModel):
+    email: str
+    otp: Optional[str] = None
+    resetToken: Optional[str] = None
+    newPassword: str
 
 
 class ExtractResponse(BaseModel):
@@ -292,6 +327,59 @@ def get_format_selector(format_id: str) -> str:
         "b[ext=mp4]/"
         "b"
     )
+
+
+# ============================================================
+# AUTH PASSWORD RESET ENDPOINT (WITH OTP)
+# ============================================================
+
+@app.post("/api/auth/reset-password-with-otp")
+async def reset_password_with_otp(data: ResetPasswordWithOtpRequest):
+    clean_email = (data.email or "").strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(status_code=400, detail="Valid email address is required")
+
+    if not data.newPassword or len(data.newPassword) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long")
+
+    otp_val = (data.otp or "").strip()
+    token_val = (data.resetToken or "").strip()
+    if not otp_val and not token_val:
+        raise HTTPException(status_code=400, detail="OTP or resetToken is required")
+
+    if not init_fb_admin():
+        raise HTTPException(
+            status_code=500,
+            detail="Firebase Admin SDK credentials not configured on server"
+        )
+
+    try:
+        user_record = fb_auth.get_user_by_email(clean_email)
+        fb_auth.update_user(user_record.uid, password=data.newPassword)
+
+        try:
+            db = fb_firestore.client()
+            db.collection("users").document(user_record.uid).set({
+                "passwordLastResetAt": fb_firestore.SERVER_TIMESTAMP,
+                "updatedAt": fb_firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+        except Exception as fs_err:
+            logger.warning(f"[FirebaseAdmin] Firestore sync warning: {fs_err}")
+
+        return {
+            "success": True,
+            "message": "Password updated successfully",
+            "uid": user_record.uid,
+            "email": clean_email,
+        }
+    except fb_auth.UserNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No account registered with email {clean_email}"
+        )
+    except Exception as e:
+        logger.exception("RESET PASSWORD WITH OTP ERROR")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================
@@ -523,6 +611,7 @@ def root():
             "GET /api/download",
             "GET /api/stream",
             "GET /api/health",
+            "POST /api/auth/reset-password-with-otp",
             "GET /api/device/check/{device_id}",
             "GET /api/devices",
             "PUT /api/{device_id}/live",
