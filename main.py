@@ -566,6 +566,7 @@ def root():
             "POST /api/v1/sanitize  (icon fix, no AI)",
             "POST /api/v1/lint  (instant checks, no AI)",
             "POST /api/v1/generate-firmware  (project setup -> .ino)",
+            "POST /api/v1/jobs/chat + GET /api/v1/jobs/{id}  (background AI, no timeout)",
             "GET /api/v1/models  (available Gemini models)"
         ]
     }
@@ -1355,6 +1356,10 @@ GEMINI_FALLBACK_MODELS = [
     m.strip() for m in (os.environ.get("GEMINI_FALLBACK_MODELS") or "gemini-3.8-flash").split(",") if m.strip()
 ]
 GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "30000"))
+# busy (503) par kitni der ruk kar dobara try kare: seconds, comma separated
+GEMINI_RETRY_WAITS = [
+    float(x) for x in (os.environ.get("GEMINI_RETRY_WAITS") or "3,6,12,20,30").split(",") if x.strip()
+]
 
 _gemini_client = None
 _gemini_lock = threading.Lock()
@@ -1456,7 +1461,7 @@ def gemini_generate(contents, system_prompt: str, json_mode: bool = True,
             continue
         tried.append(model)
 
-        for attempt in range(4):
+        for attempt in range(len(GEMINI_RETRY_WAITS) + 1):
             try:
                 resp = _call_gemini(client, model, contents, system_prompt, json_mode, temperature, max_tokens)
                 _working_model = model
@@ -1474,8 +1479,8 @@ def gemini_generate(contents, system_prompt: str, json_mode: bool = True,
                     break
                 if _is_daily_quota(msg):
                     break  # retry se kuch nahi hoga (aur request waste hoti hai)
-                if _is_transient(msg) and attempt < 3:
-                    time.sleep(2 * (2 ** attempt))  # 2s, 4s, 8s
+                if _is_transient(msg) and attempt < len(GEMINI_RETRY_WAITS):
+                    time.sleep(GEMINI_RETRY_WAITS[attempt])  # 3s, 6s, 12s, 20s, 30s
                     continue
                 break
 
@@ -2079,6 +2084,83 @@ def list_models():
         raise HTTPException(status_code=500, detail=f"Model list nahi mili: {e}")
     return {"status": "success", "configured": GEMINI_MODEL, "working": _working_model,
             "count": len(names), "models": names}
+
+
+# ---------- background jobs: app ko lamba connection khula nahi rakhna parta ----------
+# Flow: POST /api/v1/jobs/chat (foran job_id) -> GET /api/v1/jobs/{job_id} har 2 second.
+# Job memory me rehta hai: server restart / redeploy par job gum ho sakta hai (status "lost").
+
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+JOB_TTL_SECONDS = 1800
+
+
+def _dump(model_obj) -> Dict[str, Any]:
+    return model_obj.model_dump() if hasattr(model_obj, "model_dump") else model_obj.dict()
+
+
+def _prune_jobs():
+    now = time.time()
+    with _jobs_lock:
+        for jid in [j for j, v in _jobs.items() if now - v["created"] > JOB_TTL_SECONDS]:
+            _jobs.pop(jid, None)
+
+
+def _run_job(job_id: str, kind: str, payload: Dict[str, Any]):
+    with _jobs_lock:
+        _jobs[job_id]["status"] = "running"
+    try:
+        if kind == "audit":
+            result = firmware_audit(AuditRequest(**payload))
+        else:
+            result = _chat_core(ChatRequest(**payload))
+        with _jobs_lock:
+            _jobs[job_id].update(status="done", result=result, finished=time.time())
+    except HTTPException as e:
+        with _jobs_lock:
+            _jobs[job_id].update(status="error", error=str(e.detail), http_status=e.status_code, finished=time.time())
+    except Exception as e:
+        logger.exception("JOB ERROR")
+        with _jobs_lock:
+            _jobs[job_id].update(status="error", error=f"Internal error: {e}", http_status=500, finished=time.time())
+
+
+def _start_job(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    _prune_jobs()
+    job_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "queued", "kind": kind, "created": time.time()}
+    threading.Thread(target=_run_job, args=(job_id, kind, payload), daemon=True).start()
+    return {"status": "queued", "job_id": job_id}
+
+
+@app.post("/api/v1/jobs/chat")
+def job_chat(req: ChatRequest):
+    if len(req.files) > 4:
+        raise HTTPException(status_code=400, detail="Ek waqt me maximum 4 files allowed hain.")
+    return _start_job("chat", _dump(req))
+
+
+@app.post("/api/v1/jobs/audit")
+def job_audit(req: AuditRequest):
+    if not req.files:
+        raise HTTPException(status_code=400, detail="Audit ke liye kam az kam 1 file chahiye.")
+    return _start_job("audit", _dump(req))
+
+
+@app.get("/api/v1/jobs/{job_id}")
+def job_status(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return {"status": "lost", "detail": "Job nahi mila (server restart hua ho sakta hai). Dobara bhejo."}
+        out = {"status": job["status"], "elapsed": round(time.time() - job["created"], 1)}
+        if job["status"] == "done":
+            out["result"] = job["result"]
+        if job["status"] == "error":
+            out["error"] = job.get("error", "")
+            out["http_status"] = job.get("http_status", 500)
+        return out
 
 
 # ---------- project setup -> complete firmware (purana generate-firmware, ab sahi prompt ke saath) ----------
