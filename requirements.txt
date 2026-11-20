@@ -4,3 +4,4 @@ yt-dlp
 requests
 pydantic
 firebase-admin
+google-genai
