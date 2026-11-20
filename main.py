@@ -560,7 +560,13 @@ def root():
             "POST /api/auth/forgot-password",
             "POST /api/auth/reset-password",
             "POST /api/auth/change-password",
-            "POST /api/v1/chat  (Firmware Studio AI chat)"
+            "POST /api/v1/chat  (Firmware Studio AI chat)",
+            "POST /api/v1/audit  (lint + AI deep audit)",
+            "POST /api/v1/convert  (ESP32 <-> ESP8266, no AI)",
+            "POST /api/v1/sanitize  (icon fix, no AI)",
+            "POST /api/v1/lint  (instant checks, no AI)",
+            "POST /api/v1/generate-firmware  (project setup -> .ino)",
+            "GET /api/v1/models  (available Gemini models)"
         ]
     }
 
@@ -576,7 +582,8 @@ def health():
         "ffmpeg": bool(ffmpeg),
         "active_devices": list(devices_live_data.keys()),
         "gemini_configured": bool(os.environ.get("GEMINI_API_KEY")),
-        "gemini_model": GEMINI_MODEL
+        "gemini_model": GEMINI_MODEL,
+        "gemini_working_model": _working_model
     }
 
 
@@ -1338,16 +1345,20 @@ def download_video(
 
 
 # ============================================================
-# FIRMWARE STUDIO - AI CHAT (GEMINI)
-# Render > Environment: GEMINI_API_KEY (zaruri), GEMINI_MODEL (optional)
+# FIRMWARE STUDIO - AI + TOOLS (GEMINI)
+# Render > Environment: GEMINI_API_KEY (zaruri)
+# Optional: GEMINI_MODEL (default gemini-3.8-flash), GEMINI_FALLBACK_MODELS (comma separated)
 # ============================================================
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip()
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in (os.environ.get("GEMINI_FALLBACK_MODELS") or "gemini-3.8-flash").split(",") if m.strip()
+]
 GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "30000"))
 
 _gemini_client = None
 _gemini_lock = threading.Lock()
+_working_model: Optional[str] = None
 
 
 def get_gemini_client():
@@ -1367,6 +1378,87 @@ def get_gemini_client():
                 )
             _gemini_client = genai.Client(api_key=api_key)
         return _gemini_client
+
+
+def _call_gemini(client, model: str, contents, system_prompt: str, json_mode: bool,
+                 temperature: float, max_tokens: int):
+    from google.genai import types
+    cfg: Dict[str, Any] = {
+        "system_instruction": system_prompt,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+    }
+    if json_mode:
+        cfg["response_mime_type"] = "application/json"
+    return client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(**cfg),
+    )
+
+
+def _is_model_missing(msg: str) -> bool:
+    return "404" in msg or "NOT_FOUND" in msg
+
+
+def _is_transient(msg: str) -> bool:
+    keys = ("429", "500", "502", "503", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+            "overloaded", "DEADLINE", "timed out", "timeout", "Connection")
+    return any(k in msg for k in keys)
+
+
+def gemini_generate(contents, system_prompt: str, json_mode: bool = True,
+                    temperature: float = 0.2, max_tokens: Optional[int] = None):
+    """
+    Self-healing call:
+    - model 404 -> error text me jo naya model likha ho (models/xxx) usay khud try karta hai
+    - 429/503/timeout -> 2 baar retry (backoff)
+    - phir fallback models
+    Returns (response, model_used)
+    """
+    global _working_model
+    client = get_gemini_client()
+    max_tokens = max_tokens or GEMINI_MAX_OUTPUT_TOKENS
+
+    queue: List[str] = []
+    for m in [_working_model, GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
+        if m and m not in queue:
+            queue.append(m)
+
+    tried: List[str] = []
+    last_error: Optional[Exception] = None
+
+    while queue:
+        model = queue.pop(0)
+        if model in tried:
+            continue
+        tried.append(model)
+
+        for attempt in range(3):
+            try:
+                resp = _call_gemini(client, model, contents, system_prompt, json_mode, temperature, max_tokens)
+                _working_model = model
+                return resp, model
+            except Exception as e:
+                msg = str(e)
+                last_error = e
+                logger.warning(f"GEMINI {model} attempt {attempt + 1} failed: {msg[:300]}")
+                if _is_model_missing(msg):
+                    hint = re.search(r"use\s+models/([A-Za-z0-9._\-]+)", msg)
+                    if hint and hint.group(1) not in tried and hint.group(1) not in queue:
+                        queue.insert(0, hint.group(1))
+                    if _working_model == model:
+                        _working_model = None
+                    break
+                if _is_transient(msg) and attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"AI engine failed (tried: {', '.join(tried)}): {last_error}"
+    )
 
 
 # ---------- emoji / mojibake sanitizer (HTML numeric entities) ----------
@@ -1416,7 +1508,6 @@ def _build_sanitizer_pairs():
                 moji = _make_mojibake(variant, codec)
                 if moji != variant:
                     pairs[moji] = entity
-    # lambay pattern pehle replace hon (variation selector wale)
     return sorted(pairs.items(), key=lambda kv: len(kv[0]), reverse=True)
 
 
@@ -1424,12 +1515,214 @@ _SANITIZER_PAIRS = _build_sanitizer_pairs()
 
 
 def clean_mojibake_and_emojis(code: str) -> str:
+    """Patch 'replace' text ke liye: har raw emoji / mojibake ko entity banata hai."""
     if not code:
         return code
     for pattern, entity in _SANITIZER_PAIRS:
         if pattern in code:
             code = code.replace(pattern, entity)
     return code
+
+
+def sanitize_html_icons(code: str):
+    """
+    Poori .ino file ke liye SAFE icon-fix: sirf HTML wali jagah badalta hai
+    (R"rawliteral(...) blocks aur jin lines me <tag> ho). Serial.println / C++ strings me
+    entity daalna print kharab kar deta hai, isliye wahan sirf ginti batata hai.
+    Returns (new_code, replaced_lines, leftover_outside_html)
+    """
+    lines = code.split("\n")
+    in_raw = False
+    replaced = 0
+    leftover = 0
+    out = []
+    for line in lines:
+        starts = 'R"' in line and "rawliteral(" in line
+        ends = ")rawliteral" in line
+        html_zone = in_raw or starts or ("<" in line and ">" in line)
+        if html_zone:
+            new_line = clean_mojibake_and_emojis(line)
+            if new_line != line:
+                replaced += 1
+            out.append(new_line)
+        else:
+            if any(p in line for p, _ in _SANITIZER_PAIRS if p not in ("\u00B0", "\u2022")):
+                leftover += 1
+            out.append(line)
+        if starts and not ends:
+            in_raw = True
+        elif ends:
+            in_raw = False
+    return "\n".join(out), replaced, leftover
+
+
+# ---------- ESP32 <-> ESP8266 converter (NO AI: instant, same result every time) ----------
+
+_INCLUDE_PAIRS = [
+    ("WiFi.h", "ESP8266WiFi.h"),
+    ("WebServer.h", "ESP8266WebServer.h"),
+    ("HTTPClient.h", "ESP8266HTTPClient.h"),
+    ("ESPmDNS.h", "ESP8266mDNS.h"),
+]
+
+
+def convert_mcu_code(code: str, target: str):
+    target = (target or "").upper().replace(" ", "")
+    to_8266 = "8266" in target
+    changes: List[str] = []
+    warnings: List[str] = []
+
+    def sub(pattern, repl, text, label, flags=re.MULTILINE):
+        new, n = re.subn(pattern, repl, text, flags=flags)
+        if n:
+            changes.append(f"{label} ({n})")
+        return new, n
+
+    if to_8266:
+        if "ESP8266WiFi.h" in code and not re.search(r"<WiFi\.h>", code):
+            warnings.append("Code pehle se ESP8266 jaisa lag raha hai (ESP8266WiFi.h mojood hai).")
+        for a, b in _INCLUDE_PAIRS:
+            code, _ = sub(r"(#\s*include\s*)<" + re.escape(a) + r">", r"\1<" + b + ">", code, f"include {a} -> {b}")
+
+        has_soft_inc = bool(re.search(r"#\s*include\s*<SoftwareSerial\.h>", code))
+        decl_pat = (r"^[ \t]*HardwareSerial\s+InverterSerial\s*(?:\(\s*\d+\s*\))?\s*;[ \t]*$|"
+                    r"^[ \t]*#\s*define\s+InverterSerial\s+Serial2\b.*$")
+        soft_decl = "SoftwareSerial InverterSerial(3, 1);"
+        repl = soft_decl if has_soft_inc else "#include <SoftwareSerial.h>\n" + soft_decl
+        code, n = sub(decl_pat, repl, code, "Serial2 -> SoftwareSerial(3,1)")
+        code, _ = sub(r"InverterSerial\.begin\(\s*([^,()]+?)\s*,\s*SERIAL_\w+\s*,\s*\d+\s*,\s*\d+\s*\)",
+                      r"InverterSerial.begin(\1)", code, "InverterSerial.begin(baud)")
+        if n == 0 and re.search(r"\bSerial2\b", code):
+            warnings.append("Code me direct 'Serial2' use hua hai (InverterSerial nahi). Ye khud check karna padega, AI Chat se pucho.")
+        code, _ = sub(r"(MAX_HISTORY\s*=?\s*)288\b", r"\g<1>144", code, "MAX_HISTORY 288 -> 144")
+        if "setBufferSizes" not in code:
+            code, _ = sub(r"^([ \t]*)WiFiClientSecure\s+(\w+)\s*;[ \t]*$",
+                          r"\g<0>\n\1\2.setBufferSizes(512, 512);", code, "setBufferSizes(512,512) add")
+    else:
+        if "ESP8266WiFi.h" not in code and re.search(r"<WiFi\.h>", code):
+            warnings.append("Code pehle se ESP32 jaisa lag raha hai (WiFi.h mojood hai).")
+        for a, b in _INCLUDE_PAIRS:
+            code, _ = sub(r"(#\s*include\s*)<" + re.escape(b) + r">", r"\1<" + a + ">", code, f"include {b} -> {a}")
+
+        code, n = sub(r"^[ \t]*SoftwareSerial\s+InverterSerial\s*\([^)]*\)\s*;[ \t]*$",
+                      "HardwareSerial InverterSerial(2);", code, "SoftwareSerial -> HardwareSerial(2)")
+        if n:
+            code, _ = sub(r"^[ \t]*#\s*include\s*<SoftwareSerial\.h>[ \t]*\r?\n", "", code, "SoftwareSerial include removed")
+        code, _ = sub(r"InverterSerial\.begin\(\s*([^,()]+?)\s*\)",
+                      r"InverterSerial.begin(\1, SERIAL_8N1, 16, 17)", code, "InverterSerial.begin(baud,8N1,16,17)")
+        code, _ = sub(r"(MAX_HISTORY\s*=?\s*)144\b", r"\g<1>288", code, "MAX_HISTORY 144 -> 288")
+        code, _ = sub(r"^[ \t]*\w+\.setBufferSizes\(\s*512\s*,\s*512\s*\)\s*;[ \t]*\r?\n?", "", code, "setBufferSizes removed")
+
+    if not changes:
+        warnings.append("Koi badlav nahi hua: ya code pehle se target MCU ka hai, ya naam alag hain.")
+    return code, changes, warnings
+
+
+# ---------- static lint (NO AI, instant) ----------
+
+def _scan_balance(code: str):
+    """Braces / brackets balance, comments + strings + raw literals ignore karke."""
+    stack = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    i, n, line = 0, len(code), 1
+    issues = []
+    while i < n:
+        c = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        if c == "\n":
+            line += 1
+        if c == "R" and code.startswith('R"rawliteral(', i):
+            end = code.find(')rawliteral"', i)
+            if end == -1:
+                issues.append((line, "Raw string R\"rawliteral( band nahi hua"))
+                break
+            line += code.count("\n", i, end)
+            i = end + len(')rawliteral"')
+            continue
+        if c == "/" and nxt == "/":
+            j = code.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if c == "/" and nxt == "*":
+            j = code.find("*/", i + 2)
+            if j == -1:
+                issues.append((line, "Comment /* band nahi hua"))
+                break
+            line += code.count("\n", i, j)
+            i = j + 2
+            continue
+        if c in "\"'":
+            q = c
+            i += 1
+            while i < n and code[i] != q:
+                if code[i] == "\\":
+                    i += 1
+                if i < n and code[i] == "\n":
+                    break
+                i += 1
+            i += 1
+            continue
+        if c in "([{":
+            stack.append((c, line))
+        elif c in ")]}":
+            if not stack or stack[-1][0] != pairs[c]:
+                issues.append((line, f"Extra ya galat '{c}'"))
+            else:
+                stack.pop()
+        i += 1
+    for ch, ln in stack:
+        issues.append((ln, f"'{ch}' band nahi hua"))
+    return issues
+
+
+def lint_code(code: str, mcu: str = "ESP32") -> List[Dict[str, Any]]:
+    res: List[Dict[str, Any]] = []
+    is8266 = "8266" in (mcu or "")
+
+    for ln, msg in _scan_balance(code)[:20]:
+        res.append({"severity": "error", "line": ln, "problem": msg})
+
+    if is8266 and re.search(r"#\s*include\s*<(WiFi|WebServer|HTTPClient|ESPmDNS)\.h>", code):
+        res.append({"severity": "error", "line": 0, "problem": "ESP8266 target par ESP32 wale include hain (WiFi.h / WebServer.h ...)."})
+    if (not is8266) and re.search(r"#\s*include\s*<ESP8266\w+\.h>", code):
+        res.append({"severity": "error", "line": 0, "problem": "ESP32 target par ESP8266 wale include hain."})
+    if is8266 and re.search(r"HardwareSerial\s+\w+\s*\(\s*2\s*\)|\bSerial2\b", code):
+        res.append({"severity": "warning", "line": 0, "problem": "ESP8266 par Serial2 nahi hota. SoftwareSerial(3,1) use karo."})
+    if (not is8266) and "SoftwareSerial" in code:
+        res.append({"severity": "warning", "line": 0, "problem": "ESP32 par SoftwareSerial ki jagah HardwareSerial(2) behtar hai."})
+
+    lines = code.split("\n")
+    moji_lines, emoji_lines = [], []
+    for idx, text in enumerate(lines, 1):
+        for p, _ in _SANITIZER_PAIRS:
+            if p in text:
+                if p in _EMOJI_ENTITIES or p.rstrip("\ufe0f") in _EMOJI_ENTITIES:
+                    emoji_lines.append(idx)
+                else:
+                    moji_lines.append(idx)
+                break
+    if moji_lines:
+        res.append({"severity": "warning", "line": moji_lines[0],
+                    "problem": f"Mojibake (kharab icon) {len(moji_lines)} lines me. Pehli line {moji_lines[0]}."})
+    if emoji_lines:
+        res.append({"severity": "info", "line": emoji_lines[0],
+                    "problem": f"Raw emoji / symbols {len(emoji_lines)} lines me. HTML me entity behtar hai."})
+
+    for idx, text in enumerate(lines, 1):
+        m = re.search(r"\bdelay\(\s*(\d+)\s*\)", text)
+        if m and int(m.group(1)) >= 500 and not text.strip().startswith("//"):
+            res.append({"severity": "info", "line": idx, "problem": f"Blocking delay({m.group(1)}). millis() behtar hai."})
+            break
+
+    commits = len(re.findall(r"EEPROM\.commit\(\)", code))
+    if commits >= 5:
+        res.append({"severity": "info", "line": 0, "problem": f"EEPROM.commit() {commits} jagah hai. Flash wear ke liye dirty-flag + timer behtar."})
+
+    if "void setup" not in code:
+        res.append({"severity": "error", "line": 0, "problem": "void setup() nahi mila."})
+    if "void loop" not in code:
+        res.append({"severity": "error", "line": 0, "problem": "void loop() nahi mila."})
+    return res
 
 
 # ---------- request models ----------
@@ -1457,9 +1750,31 @@ class ChatRequest(BaseModel):
     history: List[ChatTurn] = []
 
 
+class ConvertRequest(BaseModel):
+    code: str
+    target: str = "ESP8266"  # "ESP8266" | "ESP32"
+
+
+class SanitizeRequest(BaseModel):
+    code: str
+
+
+class LintRequest(BaseModel):
+    code: str
+    mcu: str = "ESP32"
+
+
+class AuditRequest(BaseModel):
+    mcu: str = "ESP32"
+    files: List[ChatFile] = []
+    images: List[ChatImage] = []
+    compiler_log: str = ""
+    instruction: str = ""
+
+
 MASTER_PROMPT = """
 You are FIRMWARE STUDIO MASTER AI: a senior embedded engineer (ESP32, ESP8266,
-Arduino, solar/inverter monitoring, Firebase, HTML-in-.ino dashboards).
+Arduino, solar/inverter monitoring, Modbus/RS485, Firebase, HTML-in-.ino dashboards).
 You TALK with the developer like a human colleague, in the same language mix
 they use (Roman Urdu / English). You understand, explain, ask, diagnose, resolve.
 
@@ -1468,8 +1783,9 @@ optional screenshots / compiler logs.
 
 HOW YOU WORK
 1. Read EVERY file fully before answering. Map functions, pins, protocol, HTML blocks.
-2. If the user only asks a question ("ye function kya karta hai?", "kya ye sahi hai?"),
-   ANSWER it in "reply" and return no patches.
+2. If the user only asks a question ("ye function kya karta hai?", "kya ye sahi hai?",
+   "check karo kya issue aa raha hai"), ANSWER it in "reply" and return no patches,
+   then ask if they want you to fix it.
 3. If the user wants a change, explain in 2-5 short lines WHAT you found and WHAT you
    will change, then give surgical patches. Never rewrite whole files.
 4. Multi-file: user may say "file A se function X copy karke file B me replace karo".
@@ -1489,12 +1805,14 @@ HOW YOU WORK
    pin &#128205; bolt &#9889; refresh &#128260; gear &#9881;&#65039; check &#10003;
    close &#10005; info &#8505;&#65039; inbox &#128229; bullet &#8226; degree &#176;
    trash &#128465;&#65039; left &#11013;&#65039;. Existing entities in the file are copied
-   unchanged. Garbled sequences (mojibake, starting with characters like the Latin
-   letters with accents seen in broken emoji) found in the input are a bug: fix them.
+   unchanged. Garbled sequences (mojibake: accented Latin letters in place of an emoji)
+   found in the input are a bug: fix them.
 10. ESP32<->ESP8266 port rules: WiFi.h<->ESP8266WiFi.h, WebServer.h<->ESP8266WebServer.h,
    HTTPClient.h<->ESP8266HTTPClient.h, ESPmDNS.h<->ESP8266mDNS.h,
    Serial2(16,17)<->SoftwareSerial(3,1), MAX_HISTORY 288<->144,
    client.setBufferSizes(512,512) on 8266. Nothing else changes.
+11. Put every concrete problem in report.issues_found AND keep "reply" short and human.
+    Do not repeat the same alert twice.
 
 OUTPUT: ONLY valid JSON, no markdown fences:
 {
@@ -1508,6 +1826,20 @@ OUTPUT: ONLY valid JSON, no markdown fences:
  "alerts": [ {"level": "error|warning|info", "file": "", "message": ""} ]
 }
 Always include all four keys (empty list / empty string if nothing).
+"""
+
+GENERATOR_PROMPT = """
+You are a senior embedded engineer. Generate ONE complete, compile-ready Arduino .ino file
+for the target MCU from the project configuration the developer gives.
+Rules:
+- Output ONLY the code. No markdown fences, no explanation.
+- Correct includes for the MCU (ESP32: WiFi.h, HTTPClient.h; ESP8266: ESP8266WiFi.h, ESP8266HTTPClient.h).
+- WiFi connect with auto-reconnect, Firebase Realtime Database over HTTPS REST (WiFiClientSecure).
+- pinMode for every configured GPIO, safe boot states for relays.
+- Poll commands and upload data keys periodically, NON-BLOCKING (millis(), no long delay()).
+- Every component in the JSON list must be implemented; use its gpio, command, dataKey, unit.
+- If a local web dashboard is part of the request, use HTML numeric entities for icons, never raw emoji.
+- Comment each section briefly. The code must compile without edits.
 """
 
 
@@ -1540,6 +1872,11 @@ def _validate_patches(patches: Any, files: List[ChatFile]):
         find = p.get("find")
         src = by_name.get(fname)
 
+        if src is None and len(by_name) == 1:
+            fname = next(iter(by_name))  # ek hi file ho to naam ghalat likhne par bhi chal jaye
+            p["file"] = fname
+            src = by_name[fname]
+
         if src is None:
             alerts.append({"level": "error", "file": fname,
                            "message": "Patch target file nahi mili. Patch skip hua."})
@@ -1560,70 +1897,36 @@ def _validate_patches(patches: Any, files: List[ChatFile]):
     return ok, alerts
 
 
-def _call_gemini(client, model: str, contents):
+def _build_parts(req_files: List[ChatFile], req_images: List[ChatImage], history: List[ChatTurn], tail: str):
     from google.genai import types
-    return client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=MASTER_PROMPT,
-            temperature=0.2,
-            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-            response_mime_type="application/json",
-        ),
-    )
-
-
-# NOTE: plain "def" (async nahi) taake lambi AI call inverter live endpoints ko block na kare.
-@app.post("/api/v1/chat")
-@app.post("/api/chat")
-def firmware_chat(req: ChatRequest):
-    if len(req.files) > 4:
-        raise HTTPException(status_code=400, detail="Ek waqt me maximum 4 files allowed hain.")
-    if not req.message.strip() and not req.files and not req.images:
-        raise HTTPException(status_code=400, detail="Message ya file dena zaruri hai.")
-
-    client = get_gemini_client()
-
-    from google.genai import types
-
     parts = []
-    for h in req.history[-12:]:
+    for h in history[-12:]:
         parts.append(types.Part.from_text(text=f"[{h.role.upper()}]: {h.text}"))
-
-    for f in req.files:
+    for f in req_files:
         parts.append(types.Part.from_text(
             text=f"=== FILE: {f.name} ===\n{f.content}\n=== END FILE: {f.name} ==="
         ))
-
-    for im in req.images:
+    for im in req_images:
         try:
             raw = base64.b64decode(im.b64)
         except Exception:
             raise HTTPException(status_code=400, detail="Screenshot ka base64 data kharab hai.")
         parts.append(types.Part.from_bytes(data=raw, mime_type=im.mime or "image/png"))
+    parts.append(types.Part.from_text(text=tail))
+    return [types.Content(role="user", parts=parts)]
 
-    parts.append(types.Part.from_text(text=f"[TARGET MCU]: {req.mcu}\n[USER]: {req.message}"))
-    contents = [types.Content(role="user", parts=parts)]
 
-    used_model = GEMINI_MODEL
-    try:
-        try:
-            resp = _call_gemini(client, used_model, contents)
-        except Exception as primary_error:
-            if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != used_model:
-                logger.warning(f"MODEL {used_model} FAILED ({primary_error}); fallback {GEMINI_FALLBACK_MODEL}")
-                used_model = GEMINI_FALLBACK_MODEL
-                resp = _call_gemini(client, used_model, contents)
-            else:
-                raise
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("GEMINI CHAT ERROR")
-        raise HTTPException(status_code=500, detail=f"AI engine failed: {e}")
+def _chat_core(req: ChatRequest) -> Dict[str, Any]:
+    if len(req.files) > 4:
+        raise HTTPException(status_code=400, detail="Ek waqt me maximum 4 files allowed hain.")
+    if not req.message.strip() and not req.files and not req.images:
+        raise HTTPException(status_code=400, detail="Message ya file dena zaruri hai.")
 
-    raw_text = ""
+    get_gemini_client()
+    contents = _build_parts(req.files, req.images, req.history,
+                            f"[TARGET MCU]: {req.mcu}\n[USER]: {req.message}")
+    resp, used_model = gemini_generate(contents, MASTER_PROMPT, json_mode=True, temperature=0.2)
+
     try:
         raw_text = resp.text or ""
     except Exception:
@@ -1642,16 +1945,24 @@ def firmware_chat(req: ChatRequest):
 
     patches, bad = _validate_patches(data.get("patches", []), req.files)
     for p in patches:
-        p["replace"] = clean_mojibake_and_emojis(safe_str(p.get("replace"), "") if p.get("replace") is not None else "")
+        rep = p.get("replace")
+        p["replace"] = clean_mojibake_and_emojis(rep if isinstance(rep, str) else "")
         p["why"] = safe_str(p.get("why"), "")
 
     ai_alerts = data.get("alerts", [])
     if not isinstance(ai_alerts, list):
         ai_alerts = []
-
     report = data.get("report", {})
     if not isinstance(report, dict):
         report = {}
+
+    # same alert dobara na aaye
+    seen, alerts = set(), []
+    for a in ai_alerts + bad + parse_alerts:
+        key = (str(a.get("level")), str(a.get("file")), str(a.get("message")))
+        if key not in seen:
+            seen.add(key)
+            alerts.append(a)
 
     return {
         "status": "success",
@@ -1659,7 +1970,163 @@ def firmware_chat(req: ChatRequest):
         "reply": safe_str(data.get("reply"), ""),
         "patches": patches,
         "report": report,
-        "alerts": ai_alerts + bad + parse_alerts,
+        "alerts": alerts,
+    }
+
+
+# NOTE: plain "def" (async nahi) taake lambi AI call inverter live endpoints ko block na kare.
+@app.post("/api/v1/chat")
+@app.post("/api/chat")
+def firmware_chat(req: ChatRequest):
+    return _chat_core(req)
+
+
+@app.post("/api/v1/audit")
+def firmware_audit(req: AuditRequest):
+    """Re-Audit: pehle instant lint (AI ke baghair), phir AI deep audit. AI fail ho to bhi lint milta hai."""
+    if not req.files:
+        raise HTTPException(status_code=400, detail="Audit ke liye kam az kam 1 file chahiye.")
+    lint = {f.name: lint_code(f.content, req.mcu) for f in req.files}
+
+    msg = "Deep audit karo: har file ke saare issues dhoondo, patches do jo safe ho."
+    if req.compiler_log.strip():
+        msg += f"\n\nArduino compiler log:\n{req.compiler_log.strip()}"
+    if req.instruction.strip():
+        msg += f"\n\nExtra instruction: {req.instruction.strip()}"
+
+    try:
+        result = _chat_core(ChatRequest(mcu=req.mcu, message=msg, files=req.files, images=req.images))
+        result["lint"] = lint
+        return result
+    except HTTPException as e:
+        return {
+            "status": "partial",
+            "model": None,
+            "reply": "",
+            "patches": [],
+            "report": {"summary": "AI audit nahi chal saka, sirf instant lint dikhai ja rahi hai.",
+                       "issues_found": [], "compile_ready": not any(
+                           i["severity"] == "error" for v in lint.values() for i in v)},
+            "alerts": [{"level": "error", "file": "", "message": str(e.detail)}],
+            "lint": lint,
+        }
+
+
+@app.post("/api/v1/convert")
+def convert_endpoint(req: ConvertRequest):
+    """ESP32 <-> ESP8266. AI use nahi hota: foran hota hai, aur kabhi 404 nahi aata."""
+    new_code, changes, warnings = convert_mcu_code(req.code, req.target)
+    return {
+        "status": "success",
+        "target": req.target,
+        "code": new_code,
+        "changes": changes,
+        "warnings": warnings,
+        "lines_before": req.code.count("\n") + 1,
+        "lines_after": new_code.count("\n") + 1,
+        "lint": lint_code(new_code, req.target),
+    }
+
+
+@app.post("/api/v1/sanitize")
+def sanitize_endpoint(req: SanitizeRequest):
+    """Icon fix: HTML wali jagah raw emoji / mojibake -> entities. AI nahi."""
+    new_code, replaced, leftover = sanitize_html_icons(req.code)
+    return {"status": "success", "code": new_code, "lines_fixed": replaced,
+            "leftover_outside_html": leftover}
+
+
+@app.post("/api/v1/lint")
+def lint_endpoint(req: LintRequest):
+    issues = lint_code(req.code, req.mcu)
+    return {"status": "success", "issues": issues,
+            "compile_ready": not any(i["severity"] == "error" for i in issues)}
+
+
+@app.get("/api/v1/models")
+def list_models():
+    """Debug: aap ki key ke liye kaunse models available hain."""
+    client = get_gemini_client()
+    names = []
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if not actions or "generateContent" in actions:
+                names.append(getattr(m, "name", str(m)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model list nahi mili: {e}")
+    return {"status": "success", "configured": GEMINI_MODEL, "working": _working_model,
+            "count": len(names), "models": names}
+
+
+# ---------- project setup -> complete firmware (purana generate-firmware, ab sahi prompt ke saath) ----------
+
+class ComponentItem(BaseModel):
+    id: str = ""
+    type: str = ""  # Button, Gauge, LED, Sensor, Relay
+    label: str = ""
+    gpio: Optional[int] = None
+    command: Optional[str] = None
+    dataKey: Optional[str] = None
+    unit: Optional[str] = None
+    min: float = 0.0
+    max: float = 100.0
+    metadata: Dict[str, Any] = {}
+
+
+class FirmwareRequest(BaseModel):
+    mcu: str = "ESP32"
+    device_id: str = ""
+    firebase_host: str = ""
+    wifi_ssid: str = ""
+    wifi_pass: str = ""
+    local_ip: Optional[str] = None
+    installed_watts: Optional[float] = None
+    inverter_kw: Optional[float] = None
+    extra_instructions: str = ""
+    components: List[ComponentItem] = []
+
+
+@app.post("/api/v1/generate-firmware")
+def generate_firmware(req: FirmwareRequest):
+    get_gemini_client()
+    comps = [c.dict() for c in req.components]
+    prompt = f"""Generate the firmware for this project.
+- Target MCU: {req.mcu}
+- Device ID / Node: {req.device_id}
+- WiFi SSID: {req.wifi_ssid}
+- WiFi Password: {req.wifi_pass}
+- Firebase Host: {req.firebase_host}
+- Local IP (ESP node): {req.local_ip or "auto (DHCP)"}
+- Installed solar watts: {req.installed_watts if req.installed_watts is not None else "n/a"}
+- Inverter rating (kW): {req.inverter_kw if req.inverter_kw is not None else "n/a"}
+- Extra instructions: {req.extra_instructions or "none"}
+
+Configured components (JSON):
+{json.dumps(comps, indent=2)}
+
+Commands to execute: {[c.command for c in req.components if c.command]}
+Data keys to upload periodically: {[c.dataKey for c in req.components if c.dataKey]}
+"""
+    resp, used_model = gemini_generate(prompt, GENERATOR_PROMPT, json_mode=False, temperature=0.1)
+    try:
+        code = (resp.text or "").strip()
+    except Exception:
+        code = ""
+    if code.startswith("```"):
+        code = re.sub(r"^```[a-zA-Z+]*\s*\n", "", code)
+        code = re.sub(r"\n```\s*$", "", code).strip()
+    if not code:
+        raise HTTPException(status_code=500, detail="AI ne khali code diya. Dobara try karo.")
+
+    code, _, _ = sanitize_html_icons(code)
+    return {
+        "status": "success",
+        "mcu": req.mcu,
+        "device_id": req.device_id,
+        "model": used_model,
+        "code": code,
+        "lint": lint_code(code, req.mcu),
     }
 
 
