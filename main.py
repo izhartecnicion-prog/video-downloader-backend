@@ -1401,6 +1401,28 @@ def _is_model_missing(msg: str) -> bool:
     return "404" in msg or "NOT_FOUND" in msg
 
 
+def _is_daily_quota(msg: str) -> bool:
+    """Free tier 'requests per day' khatam: retry bekar hai, doosra model try karo."""
+    low = msg.lower()
+    return ("429" in msg or "RESOURCE_EXHAUSTED" in msg) and ("perday" in low or "per day" in low)
+
+
+def _friendly_ai_error(last_error: Optional[Exception], tried: List[str]) -> str:
+    msg = str(last_error) if last_error else ""
+    if _is_daily_quota(msg):
+        wait = re.search(r"retry in ([0-9hms.]+)", msg)
+        w = f" Reset me takreeban {wait.group(1)} baqi." if wait else ""
+        return ("QUOTA: Gemini free tier ka roz ka limit khatam ho gaya." + w +
+                " Hal: AI Studio me billing on karo, ya Render me GEMINI_FALLBACK_MODELS me doosra model daalo."
+                f" (tried: {', '.join(tried)})")
+    if "503" in msg or "UNAVAILABLE" in msg:
+        return (f"BUSY: Google ka AI server abhi busy hai (high demand). 1 minute baad dobara try karo."
+                f" (tried: {', '.join(tried)})")
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return f"BUSY: Bohat zyada requests. Thori der baad try karo. (tried: {', '.join(tried)})"
+    return f"AI engine failed (tried: {', '.join(tried)}): {last_error}"
+
+
 def _is_transient(msg: str) -> bool:
     keys = ("429", "500", "502", "503", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED",
             "overloaded", "DEADLINE", "timed out", "timeout", "Connection")
@@ -1434,7 +1456,7 @@ def gemini_generate(contents, system_prompt: str, json_mode: bool = True,
             continue
         tried.append(model)
 
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 resp = _call_gemini(client, model, contents, system_prompt, json_mode, temperature, max_tokens)
                 _working_model = model
@@ -1450,15 +1472,15 @@ def gemini_generate(contents, system_prompt: str, json_mode: bool = True,
                     if _working_model == model:
                         _working_model = None
                     break
-                if _is_transient(msg) and attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
+                if _is_daily_quota(msg):
+                    break  # retry se kuch nahi hoga (aur request waste hoti hai)
+                if _is_transient(msg) and attempt < 3:
+                    time.sleep(2 * (2 ** attempt))  # 2s, 4s, 8s
                     continue
                 break
 
-    raise HTTPException(
-        status_code=500,
-        detail=f"AI engine failed (tried: {', '.join(tried)}): {last_error}"
-    )
+    raise HTTPException(status_code=503 if _is_transient(str(last_error)) else 500,
+                        detail=_friendly_ai_error(last_error, tried))
 
 
 # ---------- emoji / mojibake sanitizer (HTML numeric entities) ----------
