@@ -2,23 +2,28 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 import yt_dlp
 import logging
 import tempfile
 import os
-import json
 import uuid
 import re
 import shutil
 import glob
 import time
+import json
+import hmac
+import hashlib
+import secrets
+import smtplib
+import threading
+import urllib.request
+from email.message import EmailMessage
 from datetime import datetime
 
 from typing import Optional, List, Dict, Any
-
-import firebase_admin
-from firebase_admin import auth as fb_auth, credentials, firestore as fb_firestore
 
 
 # ============================================================
@@ -39,8 +44,8 @@ logger = logging.getLogger("video-downloader")
 
 app = FastAPI(
     title="Universal Social Video Downloader & SSTE Multi-Inverter Gateway",
-    version="3.5.0",
-    description="Universal social media video downloader with Admin-Guarded Multi-Device Inverter IoT Gateway, Midnight Archive & Reset-All"
+    version="4.0.0",
+    description="Universal social media video downloader (URL or name search) with Admin-Guarded Multi-Device Inverter IoT Gateway, Midnight Archive, Reset-All & Firebase Password Reset"
 )
 
 app.add_middleware(
@@ -56,7 +61,8 @@ app.add_middleware(
 # MULTI-DEVICE IN-MEMORY REGISTRY & SECURITY CONFIG
 # ============================================================
 
-ADMIN_MASTER_KEY = "SAJJAD_ADMIN_786"
+# Render > Environment me ADMIN_MASTER_KEY set karein (default purani key compatibility ke liye)
+ADMIN_MASTER_KEY = os.environ.get("ADMIN_MASTER_KEY", "SAJJAD_ADMIN_786")
 
 registered_devices: set = set()
 devices_live_data: Dict[str, Any] = {}
@@ -68,42 +74,11 @@ device_daily_archives: Dict[str, list] = {}
 
 
 # ============================================================
-# FIREBASE ADMIN SDK HELPER (PASSWORD RESET WITH OTP)
-# ============================================================
-
-def init_fb_admin() -> bool:
-    if firebase_admin._apps:
-        return True
-
-    raw_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not raw_json:
-        logger.warning("[FirebaseAdmin] FIREBASE_SERVICE_ACCOUNT_JSON environment variable is not set")
-        return False
-
-    try:
-        cert_dict = json.loads(raw_json)
-        cred = credentials.Certificate(cert_dict)
-        firebase_admin.initialize_app(cred)
-        logger.info("[FirebaseAdmin] Initialized successfully")
-        return True
-    except Exception as e:
-        logger.exception(f"[FirebaseAdmin] Initialization failed: {e}")
-        return False
-
-
-# ============================================================
 # MODELS
 # ============================================================
 
 class VideoRequest(BaseModel):
     url: str
-
-
-class ResetPasswordWithOtpRequest(BaseModel):
-    email: str
-    otp: Optional[str] = None
-    resetToken: Optional[str] = None
-    newPassword: str
 
 
 class ExtractResponse(BaseModel):
@@ -229,6 +204,16 @@ def is_video_format(f: Dict[str, Any]) -> bool:
     return vcodec != "none" and ext not in AUDIO_EXTENSIONS
 
 
+def admin_key_valid(provided: Optional[str]) -> bool:
+    try:
+        return hmac.compare_digest(
+            str(provided or "").encode("utf-8"),
+            ADMIN_MASTER_KEY.encode("utf-8")
+        )
+    except Exception:
+        return False
+
+
 def get_ffmpeg_path() -> Optional[str]:
     path = shutil.which("ffmpeg")
     if path:
@@ -327,59 +312,6 @@ def get_format_selector(format_id: str) -> str:
         "b[ext=mp4]/"
         "b"
     )
-
-
-# ============================================================
-# AUTH PASSWORD RESET ENDPOINT (WITH OTP)
-# ============================================================
-
-@app.post("/api/auth/reset-password-with-otp")
-async def reset_password_with_otp(data: ResetPasswordWithOtpRequest):
-    clean_email = (data.email or "").strip().lower()
-    if not clean_email or "@" not in clean_email:
-        raise HTTPException(status_code=400, detail="Valid email address is required")
-
-    if not data.newPassword or len(data.newPassword) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long")
-
-    otp_val = (data.otp or "").strip()
-    token_val = (data.resetToken or "").strip()
-    if not otp_val and not token_val:
-        raise HTTPException(status_code=400, detail="OTP or resetToken is required")
-
-    if not init_fb_admin():
-        raise HTTPException(
-            status_code=500,
-            detail="Firebase Admin SDK credentials not configured on server"
-        )
-
-    try:
-        user_record = fb_auth.get_user_by_email(clean_email)
-        fb_auth.update_user(user_record.uid, password=data.newPassword)
-
-        try:
-            db = fb_firestore.client()
-            db.collection("users").document(user_record.uid).set({
-                "passwordLastResetAt": fb_firestore.SERVER_TIMESTAMP,
-                "updatedAt": fb_firestore.SERVER_TIMESTAMP,
-            }, merge=True)
-        except Exception as fs_err:
-            logger.warning(f"[FirebaseAdmin] Firestore sync warning: {fs_err}")
-
-        return {
-            "success": True,
-            "message": "Password updated successfully",
-            "uid": user_record.uid,
-            "email": clean_email,
-        }
-    except fb_auth.UserNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No account registered with email {clean_email}"
-        )
-    except Exception as e:
-        logger.exception("RESET PASSWORD WITH OTP ERROR")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================
@@ -503,7 +435,7 @@ async def admin_release_device(device_id: str, request: Request):
     clean_id = device_id.strip()
 
     admin_key = request.headers.get("X-Admin-Key")
-    if admin_key != ADMIN_MASTER_KEY:
+    if not admin_key_valid(admin_key):
         raise HTTPException(status_code=403, detail="Unauthorized: Only Admin (Mr. Sajjad) can release bound hardware.")
 
     was_registered = clean_id in registered_devices
@@ -536,7 +468,7 @@ async def admin_reset_all_device_data(device_id: str, request: Request):
     clean_id = device_id.strip()
 
     admin_key = request.headers.get("X-Admin-Key")
-    if admin_key != ADMIN_MASTER_KEY:
+    if not admin_key_valid(admin_key):
         raise HTTPException(status_code=403, detail="Unauthorized: Admin key required to reset all data.")
 
     if clean_id in devices_live_data:
@@ -601,7 +533,7 @@ def root():
     return {
         "status": "online",
         "service": "Universal Social Video Downloader & SSTE Multi-Inverter API",
-        "version": "3.5.0",
+        "version": "4.0.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
@@ -611,7 +543,6 @@ def root():
             "GET /api/download",
             "GET /api/stream",
             "GET /api/health",
-            "POST /api/auth/reset-password-with-otp",
             "GET /api/device/check/{device_id}",
             "GET /api/devices",
             "PUT /api/{device_id}/live",
@@ -621,7 +552,13 @@ def root():
             "POST /api/{device_id}/command",
             "DELETE /api/admin/device/{device_id}",
             "DELETE /api/admin/device/{device_id}/reset-all",
-            "GET /api/firmware-check"
+            "GET /api/firmware-check",
+            "GET|POST /api/search  (search by name)",
+            "POST /api/extract  (URL or name)",
+            "GET /api/auth/status",
+            "POST /api/auth/forgot-password",
+            "POST /api/auth/reset-password",
+            "POST /api/auth/change-password"
         ]
     }
 
@@ -632,7 +569,7 @@ def health():
     return {
         "status": "ok",
         "service": "video-downloader-backend",
-        "version": "3.5.0",
+        "version": "4.0.0",
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(ffmpeg),
         "active_devices": list(devices_live_data.keys())
@@ -640,13 +577,489 @@ def health():
 
 
 # ============================================================
-# EXTRACT & DOWNLOAD (UNCHANGED)
+# SMART SEARCH (VIDEO NAME OR URL)
+# ============================================================
+
+# NOTE: Sirf wahi platforms jin ka yt-dlp search support deta hai.
+# TikTok / Instagram / Facebook ka naam-search possible nahi, un ka URL paste karna hota hai.
+SEARCH_PROVIDERS: Dict[str, str] = {
+    "youtube": "ytsearch",
+    "soundcloud": "scsearch",
+    "bilibili": "bilisearch",
+}
+
+SEARCH_CACHE_TTL = 300
+SEARCH_CACHE_MAX = 200
+_search_cache: Dict[str, Any] = {}
+
+
+class SearchRequest(BaseModel):
+    query: str
+    limit: int = 10
+    platform: str = "youtube"
+
+
+def looks_like_url(text: Any) -> bool:
+    value = safe_str(text)
+    if not value or " " in value:
+        return False
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://", "//", "www.")):
+        return True
+    return bool(re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+(/|\?|#|$)", lowered))
+
+
+def _normalize_search_entry(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, Any]]:
+    if not entry or not isinstance(entry, dict):
+        return None
+
+    video_id = safe_str(entry.get("id"))
+    url = safe_str(entry.get("webpage_url") or entry.get("url"))
+
+    if provider == "youtube" and not url.startswith("http") and video_id:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+    if not url.startswith("http"):
+        return None
+
+    thumbnail = safe_str(entry.get("thumbnail"))
+    if not thumbnail:
+        thumbs = entry.get("thumbnails") or []
+        if isinstance(thumbs, list) and thumbs and isinstance(thumbs[-1], dict):
+            thumbnail = safe_str(thumbs[-1].get("url"))
+    if not thumbnail and provider == "youtube" and video_id:
+        thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+    duration = safe_int(entry.get("duration"), 0)
+
+    return {
+        "id": video_id,
+        "title": safe_str(entry.get("title"), "Untitled"),
+        "url": url,
+        "thumbnail": thumbnail,
+        "duration": duration,
+        "duration_formatted": (
+            f"{duration // 60:02d}:{duration % 60:02d}" if duration > 0 else ""
+        ),
+        "author": safe_str(
+            entry.get("uploader") or entry.get("channel") or entry.get("creator"), ""
+        ),
+        "view_count": safe_int(entry.get("view_count"), 0),
+        "platform": provider,
+    }
+
+
+def run_search(query: str, limit: int = 10, platform: str = "youtube") -> Dict[str, Any]:
+    query = safe_str(query)
+    if not query:
+        raise HTTPException(status_code=400, detail="Search text is empty.")
+
+    limit = max(1, min(safe_int(limit, 10), 30))
+    platform_key = safe_str(platform, "youtube").lower()
+
+    if platform_key == "all":
+        providers = list(SEARCH_PROVIDERS.items())
+    elif platform_key in SEARCH_PROVIDERS:
+        providers = [(platform_key, SEARCH_PROVIDERS[platform_key])]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported search platform '{platform_key}'. Use: all, {', '.join(SEARCH_PROVIDERS)}."
+        )
+
+    cache_key = f"{platform_key}|{limit}|{query.lower()}"
+    cached = _search_cache.get(cache_key)
+    if cached and (time.time() - cached[0]) < SEARCH_CACHE_TTL:
+        return cached[1]
+
+    per_provider = limit if len(providers) == 1 else max(3, limit // len(providers))
+    results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for name, prefix in providers:
+        try:
+            opts = get_extract_options()
+            opts.update({
+                "extract_flat": True,
+                "noplaylist": False,
+                "playlistend": per_provider,
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"{prefix}{per_provider}:{query}", download=False)
+
+            for entry in (info or {}).get("entries") or []:
+                item = _normalize_search_entry(entry, name)
+                if item:
+                    results.append(item)
+        except Exception as search_error:
+            logger.warning(f"SEARCH FAILED | provider={name} | {search_error}")
+            errors.append(f"{name}: {search_error}")
+
+    if not results:
+        if errors:
+            raise HTTPException(status_code=502, detail="Search failed. Please try again later.")
+        raise HTTPException(status_code=404, detail="No results found.")
+
+    payload = {
+        "type": "search",
+        "query": query,
+        "platform": platform_key,
+        "count": len(results),
+        "results": results,
+    }
+
+    if len(_search_cache) >= SEARCH_CACHE_MAX:
+        oldest = sorted(_search_cache.items(), key=lambda kv: kv[1][0])[: SEARCH_CACHE_MAX // 2]
+        for key, _ in oldest:
+            _search_cache.pop(key, None)
+    _search_cache[cache_key] = (time.time(), payload)
+
+    return payload
+
+
+def resolve_to_url(text: str) -> str:
+    """URL ho to clean karo, naam ho to pehla search result ka URL return karo."""
+    if looks_like_url(text):
+        return clean_url(text)
+    result = run_search(text, limit=1, platform="youtube")
+    return result["results"][0]["url"]
+
+
+@app.get("/api/search")
+@app.get("/api/v1/search")
+def search_videos_get(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(10, ge=1, le=30),
+    platform: str = Query("youtube")
+):
+    return run_search(q, limit, platform)
+
+
+@app.post("/api/search")
+@app.post("/api/v1/search")
+def search_videos_post(data: SearchRequest):
+    return run_search(data.query, data.limit, data.platform)
+
+
+# ============================================================
+# AUTH: FORGOT / RESET / CHANGE PASSWORD (FIREBASE ADMIN SDK)
+# ============================================================
+#
+# Asal masla: app naya password sirf database me likhti thi, jab k login
+# Firebase Authentication se hota hai. Password sirf Admin SDK ke
+# auth.update_user(uid, password=...) se badalta hai, aur wo server par hi chal sakta hai.
+#
+# Render Environment Variables:
+#   FIREBASE_SERVICE_ACCOUNT_JSON = poori service-account JSON
+#   BREVO_API_KEY + MAIL_FROM  (recommended: HTTPS email API)
+#   ya SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
+#   PASSWORD_MIN_LENGTH (optional, default 6)
+
+PASSWORD_MIN_LENGTH = max(6, safe_int(os.environ.get("PASSWORD_MIN_LENGTH"), 6))
+OTP_TTL_SECONDS = 600
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_COOLDOWN = 60
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# In-memory store: Render restart ya multiple instances par OTP reset ho jata hai.
+_otp_store: Dict[str, Dict[str, Any]] = {}
+_firebase_lock = threading.Lock()
+_firebase_auth_module: Any = None
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    otp: str
+    new_password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    id_token: str
+    new_password: str
+
+
+def get_firebase_auth() -> Any:
+    """Firebase Admin lazily initialise hota hai, taake env missing ho to downloader/gateway na ruke."""
+    global _firebase_auth_module
+    if _firebase_auth_module is not None:
+        return _firebase_auth_module
+
+    with _firebase_lock:
+        if _firebase_auth_module is not None:
+            return _firebase_auth_module
+
+        try:
+            import firebase_admin
+            from firebase_admin import auth as fb_auth
+            from firebase_admin import credentials
+        except ImportError:
+            logger.error("firebase-admin package is not installed")
+            raise HTTPException(status_code=503, detail="Password service unavailable (server setup incomplete).")
+
+        try:
+            if not firebase_admin._apps:
+                raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+                file_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE", "").strip()
+
+                if raw:
+                    cred = credentials.Certificate(json.loads(raw, strict=False))
+                elif file_path and os.path.isfile(file_path):
+                    cred = credentials.Certificate(file_path)
+                else:
+                    logger.error("Firebase credentials env variable is missing")
+                    raise HTTPException(status_code=503, detail="Password service unavailable (server setup incomplete).")
+
+                firebase_admin.initialize_app(cred)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Firebase initialisation failed")
+            raise HTTPException(status_code=503, detail="Password service unavailable (server setup incomplete).")
+
+        _firebase_auth_module = fb_auth
+        return _firebase_auth_module
+
+
+def email_is_configured() -> bool:
+    if os.environ.get("BREVO_API_KEY") and (os.environ.get("MAIL_FROM") or os.environ.get("SMTP_FROM")):
+        return True
+    return bool(
+        os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASS")
+    )
+
+
+def send_reset_email(to_email: str, otp: str) -> None:
+    subject = "SSTE / EMP Password Reset Code"
+    body = (
+        f"Your password reset code is: {otp}\n\n"
+        f"This code expires in {OTP_TTL_SECONDS // 60} minutes.\n"
+        "If you did not request this, you can ignore this email."
+    )
+    sender_email = (
+        os.environ.get("MAIL_FROM") or os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or ""
+    )
+    sender_name = os.environ.get("MAIL_FROM_NAME", "SSTE Solar Smart Energy")
+
+    brevo_key = os.environ.get("BREVO_API_KEY", "").strip()
+    if brevo_key:
+        if not sender_email:
+            raise RuntimeError("MAIL_FROM is not set")
+        payload = json.dumps({
+            "sender": {"name": sender_name, "email": sender_email},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "textContent": body,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=payload,
+            headers={
+                "api-key": brevo_key,
+                "Content-Type": "application/json",
+                "accept": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status >= 300:
+                raise RuntimeError(f"Brevo returned HTTP {resp.status}")
+        return
+
+    host = os.environ.get("SMTP_HOST", "").strip()
+    user = os.environ.get("SMTP_USER", "").strip()
+    password = os.environ.get("SMTP_PASS", "")
+    if not (host and user and password):
+        raise RuntimeError("Email is not configured")
+
+    port = safe_int(os.environ.get("SMTP_PORT"), 587)
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{sender_name} <{sender_email or user}>"
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=20) as server:
+            server.login(user, password)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(user, password)
+            server.send_message(msg)
+
+
+def _normalize_email(value: Any) -> str:
+    email = safe_str(value).lower()
+    if not EMAIL_REGEX.match(email) or len(email) > 254:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    return email
+
+
+def _validate_new_password(value: Any) -> str:
+    password = value if isinstance(value, str) else ""
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {PASSWORD_MIN_LENGTH} characters."
+        )
+    if len(password) > 128:
+        raise HTTPException(status_code=400, detail="Password is too long.")
+    return password
+
+
+def _hash_otp(email: str, otp: str) -> str:
+    return hashlib.sha256(f"{email}:{otp}".encode("utf-8")).hexdigest()
+
+
+def _purge_expired_otps() -> None:
+    now = time.time()
+    for key in [k for k, v in _otp_store.items() if now > v.get("exp", 0)]:
+        _otp_store.pop(key, None)
+
+
+@app.get("/api/auth/status")
+def auth_status():
+    """Render par setup check karne ke liye (koi secret return nahi hota)."""
+    try:
+        import firebase_admin  # noqa: F401
+        sdk_installed = True
+    except ImportError:
+        sdk_installed = False
+
+    return {
+        "firebase_admin_installed": sdk_installed,
+        "firebase_credentials_set": bool(
+            os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON") or os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE")
+        ),
+        "email_configured": email_is_configured(),
+        "password_min_length": PASSWORD_MIN_LENGTH,
+    }
+
+
+@app.post("/api/auth/forgot-password")
+def forgot_password(data: ForgotPasswordRequest):
+    email = _normalize_email(data.email)
+    fb_auth = get_firebase_auth()
+
+    if not email_is_configured():
+        logger.error("Forgot-password requested but email is not configured")
+        raise HTTPException(status_code=503, detail="Password service unavailable (email not configured).")
+
+    _purge_expired_otps()
+    existing = _otp_store.get(email)
+    if existing and (time.time() - existing["sent_at"]) < OTP_RESEND_COOLDOWN:
+        raise HTTPException(status_code=429, detail="Please wait a minute before requesting another code.")
+
+    generic = {"status": "ok", "detail": "If this email is registered, a reset code has been sent."}
+    now = time.time()
+
+    try:
+        fb_auth.get_user_by_email(email)
+    except fb_auth.UserNotFoundError:
+        # Account enumeration se bachao: same response aur same cooldown
+        _otp_store[email] = {"hash": None, "exp": now + OTP_TTL_SECONDS, "sent_at": now, "attempts": 0}
+        return generic
+    except Exception:
+        logger.exception("Firebase user lookup failed")
+        raise HTTPException(status_code=502, detail="Could not process the request. Try again later.")
+
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        send_reset_email(email, otp)
+    except Exception:
+        logger.exception("Reset email sending failed")
+        raise HTTPException(status_code=502, detail="Could not send the reset email. Try again later.")
+
+    _otp_store[email] = {
+        "hash": _hash_otp(email, otp),
+        "exp": now + OTP_TTL_SECONDS,
+        "sent_at": now,
+        "attempts": 0,
+    }
+    logger.info("PASSWORD RESET CODE SENT")
+    return generic
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(data: ResetPasswordRequest):
+    email = _normalize_email(data.email)
+    otp = safe_str(data.otp)
+    new_password = _validate_new_password(data.new_password)
+
+    _purge_expired_otps()
+    invalid = HTTPException(status_code=400, detail="Invalid or expired code.")
+
+    entry = _otp_store.get(email)
+    if not entry or not entry.get("hash") or time.time() > entry["exp"]:
+        raise invalid
+
+    entry["attempts"] += 1
+    if entry["attempts"] > OTP_MAX_ATTEMPTS:
+        _otp_store.pop(email, None)
+        raise HTTPException(status_code=429, detail="Too many attempts. Please request a new code.")
+
+    if not hmac.compare_digest(entry["hash"], _hash_otp(email, otp)):
+        raise invalid
+
+    fb_auth = get_firebase_auth()
+    try:
+        user = fb_auth.get_user_by_email(email)
+        fb_auth.update_user(user.uid, password=new_password)   # <-- asal fix
+        fb_auth.revoke_refresh_tokens(user.uid)                 # purane sessions khatam
+    except fb_auth.UserNotFoundError:
+        _otp_store.pop(email, None)
+        raise invalid
+    except Exception:
+        logger.exception("Firebase password update failed")
+        raise HTTPException(status_code=500, detail="Password update failed. Please try again.")
+
+    _otp_store.pop(email, None)
+    logger.info("PASSWORD RESET COMPLETED")
+    return {"status": "ok", "detail": "Password updated. Please log in with your new password."}
+
+
+@app.post("/api/auth/change-password")
+def change_password(data: ChangePasswordRequest):
+    """Logged-in user ke liye: app Firebase ID token bhejti hai + naya password."""
+    new_password = _validate_new_password(data.new_password)
+    fb_auth = get_firebase_auth()
+
+    try:
+        decoded = fb_auth.verify_id_token(safe_str(data.id_token), check_revoked=True)
+        uid = decoded["uid"]
+    except Exception:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+
+    try:
+        fb_auth.update_user(uid, password=new_password)
+        fb_auth.revoke_refresh_tokens(uid)
+    except Exception:
+        logger.exception("Firebase password change failed")
+        raise HTTPException(status_code=500, detail="Password update failed. Please try again.")
+
+    return {"status": "ok", "detail": "Password changed. Please log in again."}
+
+
+# ============================================================
+# EXTRACT & DOWNLOAD (URL OR NAME)
 # ============================================================
 
 @app.post("/api/extract")
 @app.post("/api/v1/extract")
 def extract_video_info(data: VideoRequest):
     try:
+        # Agar user ne URL ki jagah naam likha hai to search results return hon
+        if not looks_like_url(data.url):
+            logger.info(f"EXTRACT -> SEARCH MODE: {data.url}")
+            return run_search(data.url, limit=15, platform="youtube")
+
         original_url = clean_url(data.url)
         logger.info(f"EXTRACT REQUEST: {original_url}")
 
@@ -777,6 +1190,7 @@ def extract_video_info(data: VideoRequest):
         )
 
         return {
+            "type": "video",
             "title": title,
             "thumbnail": thumbnail,
             "duration": duration,
@@ -820,7 +1234,7 @@ def download_video(
     job_id = uuid.uuid4().hex
 
     try:
-        original_url = clean_url(url)
+        original_url = resolve_to_url(url)
         requested_format = safe_str(format_id, "best")
 
         ffmpeg_path = get_ffmpeg_path()
@@ -901,7 +1315,8 @@ def download_video(
         return FileResponse(
             path=final_file,
             media_type=media_type,
-            filename=download_name
+            filename=download_name,
+            background=BackgroundTask(shutil.rmtree, temp_dir, True)
         )
 
     except HTTPException:
@@ -913,6 +1328,7 @@ def download_video(
 
     except Exception as e:
         logger.exception(f"DOWNLOAD ERROR | JOB={job_id}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
         message = str(e)
         raise HTTPException(status_code=500, detail=f"Video download failed: {message}")
 
